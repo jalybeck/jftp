@@ -1,0 +1,34 @@
+[package]
+name = "jftp"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+description = "Secure stateful file transfer over an SSH JSONL subsystem"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+glob = "0.3"
+rand = "0.10"
+rpassword = "7.4"
+russh = { version = "0.63.3", default-features = false, features = ["ring", "flate2", "rsa"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+shell-words = "1.1"
+tokio = { version = "1.48", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+uuid = { version = "1.18", features = ["v4"] }
+
+[lib]
+name = "jftp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jftp"
+path = "src/bin/jftp.rs"
+
+[[bin]]
+name = "jftp-server"
+path = "src/bin/jftp-server.rs"
