@@ -76,7 +76,6 @@ struct DeletionJob {
 pub struct JftpHandler {
     context: Arc<ServerContext>,
     state: SessionState,
-    channel_handle: Option<Channel<server::Msg>>,
 }
 
 impl JftpHandler {
@@ -84,7 +83,6 @@ impl JftpHandler {
         Self {
             context,
             state: SessionState::default(),
-            channel_handle: None,
         }
     }
 
@@ -844,7 +842,11 @@ impl Handler for JftpHandler {
             reply.reject(ChannelOpenFailure::ResourceShortage).await;
         } else {
             self.state.channel = Some(channel.id());
-            self.channel_handle = Some(channel);
+            // This handler consumes channel data in `Handler::data`. Keeping
+            // the Channel's separate read queue alive would duplicate every
+            // packet into a bounded queue that this callback never drains.
+            // Drop the receiver so russh can continue dispatching callbacks.
+            drop(channel);
             reply.accept().await;
         }
         Ok(())
@@ -956,7 +958,6 @@ impl Handler for JftpHandler {
         if self.state.channel == Some(channel) {
             self.state.channel = None;
             self.state.subsystem_ready = false;
-            self.channel_handle = None;
             if let Some(job) = &self.state.deletion {
                 job.cancellation.cancel();
             }

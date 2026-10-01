@@ -1,7 +1,8 @@
 use std::{
-    io::SeekFrom,
+    io::{SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 
 use anyhow::{Context, bail};
@@ -422,6 +423,7 @@ where
         let mut source = File::open(local).await?;
         let mut remaining = size;
         let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+        let mut progress = TransferProgress::new("upload", size);
         while remaining > 0 {
             let length =
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
@@ -431,6 +433,7 @@ where
             }
             self.writer.write_all(&buffer[..read]).await?;
             remaining -= read as u64;
+            progress.advance(read as u64);
         }
         self.writer.flush().await?;
         self.read_stream(&id, false).await?;
@@ -466,6 +469,7 @@ where
             .with_context(|| {
                 format!("cannot create local temporary file {}", temporary.display())
             })?;
+        let mut progress = TransferProgress::new("download", size);
         let transfer_result = async {
             let mut remaining = size;
             let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
@@ -478,6 +482,7 @@ where
                     .context("SSH connection closed during download")?;
                 destination.write_all(&buffer[..length]).await?;
                 remaining -= length as u64;
+                progress.advance(length as u64);
             }
             destination.flush().await?;
             drop(destination);
@@ -504,6 +509,96 @@ where
         transfer_result?;
         println!("saved {} bytes to {}", size, local.display());
         Ok(())
+    }
+}
+
+const PROGRESS_BAR_WIDTH: usize = 24;
+
+struct TransferProgress {
+    direction: &'static str,
+    total: u64,
+    transferred: u64,
+    last_draw: Instant,
+    line_open: bool,
+}
+
+impl TransferProgress {
+    fn new(direction: &'static str, total: u64) -> Self {
+        let mut progress = Self {
+            direction,
+            total,
+            transferred: 0,
+            last_draw: Instant::now(),
+            line_open: true,
+        };
+        progress.draw();
+        progress
+    }
+
+    fn advance(&mut self, bytes: u64) {
+        self.transferred = self.transferred.saturating_add(bytes).min(self.total);
+        if self.transferred == self.total || self.last_draw.elapsed().as_millis() >= 100 {
+            self.draw();
+        }
+    }
+
+    fn draw(&mut self) {
+        let filled = if self.total == 0 {
+            PROGRESS_BAR_WIDTH
+        } else {
+            ((u128::from(self.transferred) * PROGRESS_BAR_WIDTH as u128) / u128::from(self.total))
+                as usize
+        };
+        let percent = if self.total == 0 {
+            100.0
+        } else {
+            self.transferred as f64 / self.total as f64 * 100.0
+        };
+        let bar = format!(
+            "{}{}",
+            "#".repeat(filled),
+            "-".repeat(PROGRESS_BAR_WIDTH - filled)
+        );
+        let mut stderr = std::io::stderr().lock();
+        let _ = write!(
+            stderr,
+            "\r{} [{bar}] {:3.0}% {} / {}",
+            self.direction,
+            percent,
+            format_bytes(self.transferred),
+            format_bytes(self.total)
+        );
+        if self.transferred == self.total {
+            let _ = writeln!(stderr);
+            self.line_open = false;
+        }
+        let _ = stderr.flush();
+        self.last_draw = Instant::now();
+    }
+}
+
+impl Drop for TransferProgress {
+    fn drop(&mut self) {
+        if self.line_open {
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(stderr);
+            let _ = stderr.flush();
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
