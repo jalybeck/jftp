@@ -49,6 +49,8 @@ Start the server:
 jftp-server --port 2222 --path ./shared
 ```
 
+By default, the server listens on `0.0.0.0`, all IPv4 interfaces. To accept connections only from the same machine, use `--bind 127.0.0.1`. To listen on one network interface, use its local IP address, for example `--bind 192.168.1.10`. IPv6 addresses are also accepted. Network access still depends on the machine's firewall.
+
 `--path` defaults to the process's current working directory. `home` in `users.toml` is a relative directory below `--path`; each account is confined to that canonical home directory. Absolute client paths are virtual paths from that home, so `/` means the account's home.
 
 The server reads `users.toml` at startup. Restart it after adding or updating a user so the changes take effect. `jftp-server-admin` is a local configuration tool; it does not add a remote user-management command to the SSH protocol.

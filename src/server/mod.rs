@@ -2,7 +2,7 @@ mod handler;
 
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -103,6 +103,7 @@ pub async fn default_config_directory() -> anyhow::Result<PathBuf> {
 
 pub async fn run(
     root_arg: PathBuf,
+    bind: IpAddr,
     port: u16,
     users_arg: Option<PathBuf>,
     host_key_arg: Option<PathBuf>,
@@ -246,8 +247,9 @@ pub async fn run(
             .fingerprint(keys::ssh_key::HashAlg::Sha256)
     );
     eprintln!("jftp host public key: {public_line}");
+    let listen_address = SocketAddr::new(bind, port);
     eprintln!(
-        "Listening on 0.0.0.0:{port}; served root: {}",
+        "Listening on {listen_address}; served root: {}",
         root_directory.display()
     );
 
@@ -266,7 +268,7 @@ pub async fn run(
     });
 
     let mut server = JftpServer { context };
-    server.run_on_address(config, ("0.0.0.0", port)).await?;
+    server.run_on_address(config, listen_address).await?;
     Ok(())
 }
 
