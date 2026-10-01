@@ -11,8 +11,8 @@ The latest automatically built packages contain all three binaries. Pushing a ne
 <!-- BUILD_TABLE_START -->
 | Package | Platform | Built |
 | --- | --- | --- |
-| [jftp_win_x64.zip](https://github.com/jalybeck/jftp/releases/latest/download/jftp_win_x64.zip) | Windows x64 | After first tagged build |
-| [jftp_linux_x64.tar.gz](https://github.com/jalybeck/jftp/releases/latest/download/jftp_linux_x64.tar.gz) | Linux x64 | After first tagged build |
+| [jftp_win_x64.zip](https://github.com/jalybeck/jftp/releases/latest/download/jftp_win_x64.zip) | Windows x64 | 2026-10-01 16:59 UTC |
+| [jftp_linux_x64.tar.gz](https://github.com/jalybeck/jftp/releases/latest/download/jftp_linux_x64.tar.gz) | Linux x64 | 2026-10-01 16:59 UTC |
 <!-- BUILD_TABLE_END -->
 
 Download the package for your platform and extract it. The three executables are in the archive's root.
