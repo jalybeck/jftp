@@ -1,5 +1,5 @@
-# Copy this file to the server's per-user jftp config directory as users.toml.
-# Copy the client's public key line into alice.pub beside users.toml.
+# Manual configuration example. Prefer jftp-server-admin add-user for setup.
+# If managing this file directly, put the client's public key in alice.pub beside it.
 
 [[users]]
 name = "alice"

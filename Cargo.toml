@@ -19,6 +19,7 @@ shell-words = "1.1"
 tokio = { version = "1.48", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.9"
+toml_edit = "0.23"
 uuid = { version = "1.18", features = ["v4"] }
 
 [lib]
@@ -32,3 +33,7 @@ path = "src/bin/jftp.rs"
 [[bin]]
 name = "jftp-server"
 path = "src/bin/jftp-server.rs"
+
+[[bin]]
+name = "jftp-server-admin"
+path = "src/bin/jftp-server-admin.rs"

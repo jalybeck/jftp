@@ -1,4 +1,5 @@
 use std::{
+    io::SeekFrom,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -14,7 +15,10 @@ use russh::{
 use serde_json::{Value, json};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{
+        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt,
+        BufReader,
+    },
     net::ToSocketAddrs,
 };
 use uuid::Uuid;
@@ -72,22 +76,151 @@ impl client::Handler for JftpClientHandler {
         server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         let key = server_public_key.public_key();
-        let trusted = keys::check_known_hosts_path(&self.host, self.port, &key, &self.known_hosts)
-            .unwrap_or(false);
-        if !trusted {
-            eprintln!(
-                "Untrusted SSH host key for {}:{}: {}",
-                self.host,
-                self.port,
-                key.fingerprint(HashAlg::Sha256)
-            );
-            eprintln!(
-                "Verify this fingerprint out of band and add the host key to {}",
-                self.known_hosts.display()
-            );
+        match keys::check_known_hosts_path(&self.host, self.port, &key, &self.known_hosts) {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(keys::Error::KeyChanged { line }) => {
+                eprintln!(
+                    "WARNING: SSH host key for {}:{} differs from the key in {} on line {}.",
+                    self.host,
+                    self.port,
+                    self.known_hosts.display(),
+                    line
+                );
+                eprintln!(
+                    "Current fingerprint: {}. Verify the change and update known_hosts manually.",
+                    key.fingerprint(HashAlg::Sha256)
+                );
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(error).context(format!(
+                    "could not check known hosts file {}",
+                    self.known_hosts.display()
+                )));
+            }
         }
-        Ok(trusted)
+
+        if !confirm_host_key(&self.host, self.port, &key, &self.known_hosts).await? {
+            return Ok(false);
+        }
+
+        // Another client may have added the host while this confirmation was
+        // waiting for input. Re-check before appending, and never override a
+        // changed key.
+        match keys::check_known_hosts_path(&self.host, self.port, &key, &self.known_hosts) {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                add_known_host(&self.host, self.port, &key, &self.known_hosts).await?;
+                eprintln!(
+                    "Added {}:{} to {}",
+                    self.host,
+                    self.port,
+                    self.known_hosts.display()
+                );
+                Ok(true)
+            }
+            Err(keys::Error::KeyChanged { line }) => {
+                eprintln!(
+                    "A different SSH host key for {}:{} was added to {} on line {} while confirming. Refusing the connection.",
+                    self.host,
+                    self.port,
+                    self.known_hosts.display(),
+                    line
+                );
+                Ok(false)
+            }
+            Err(error) => Err(anyhow::anyhow!(error).context(format!(
+                "could not check known hosts file {}",
+                self.known_hosts.display()
+            ))),
+        }
     }
+}
+
+async fn confirm_host_key(
+    host: &str,
+    port: u16,
+    key: &russh::keys::ssh_key::PublicKey,
+    known_hosts: &Path,
+) -> anyhow::Result<bool> {
+    let endpoint = if port == 22 {
+        host.to_owned()
+    } else {
+        format!("{host}:{port}")
+    };
+    let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
+    let algorithm = format!("{:?}", key.algorithm());
+    let known_hosts = known_hosts.display().to_string();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        use std::io::{self, Write};
+
+        eprintln!("The authenticity of host '{endpoint}' cannot be established.");
+        eprintln!("{algorithm} key fingerprint is {fingerprint}.");
+        eprintln!("Verify this fingerprint before trusting the server.");
+        eprint!("Trust this server and add its key to {known_hosts}? (yes/no): ");
+        io::stderr().flush()?;
+
+        let mut response = String::new();
+        if io::stdin().read_line(&mut response)? == 0 {
+            return Ok(false);
+        }
+        Ok(matches!(
+            response.trim().to_ascii_lowercase().as_str(),
+            "yes" | "y"
+        ))
+    })
+    .await
+    .context("could not read host-key confirmation")?
+}
+
+async fn add_known_host(
+    host: &str,
+    port: u16,
+    key: &russh::keys::ssh_key::PublicKey,
+    known_hosts: &Path,
+) -> anyhow::Result<()> {
+    if let Some(parent) = known_hosts
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("cannot create SSH directory {}", parent.display()))?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true).append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(known_hosts)
+        .await
+        .with_context(|| format!("cannot open known hosts file {}", known_hosts.display()))?;
+
+    if file.metadata().await?.len() > 0 {
+        file.seek(SeekFrom::End(-1)).await?;
+        let mut last_byte = [0u8; 1];
+        file.read_exact(&mut last_byte).await?;
+        file.seek(SeekFrom::End(0)).await?;
+        if last_byte[0] != b'\n' {
+            file.write_all(b"\n").await?;
+        }
+    }
+    if port == 22 {
+        file.write_all(format!("{host} ").as_bytes()).await?;
+    } else {
+        file.write_all(format!("[{host}]:{port} ").as_bytes())
+            .await?;
+    }
+    file.write_all(key.to_openssh()?.as_bytes()).await?;
+    file.write_all(b"\n").await?;
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(())
 }
 
 pub struct ClientSession<R, W> {

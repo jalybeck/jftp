@@ -275,7 +275,7 @@ fn add_authorized_key(
     source: &str,
     username: &str,
 ) -> anyhow::Result<()> {
-    let key = keys::parse_public_key_base64(source)
+    let key = parse_public_key_line(source)
         .with_context(|| format!("invalid authorized key for user {username:?}"))?;
     if key.algorithm() != Algorithm::Ed25519 {
         bail!("user {username:?} has a non-Ed25519 authorized key");
@@ -284,6 +284,24 @@ fn add_authorized_key(
         authorized_keys.push(key);
     }
     Ok(())
+}
+
+/// Parse an OpenSSH public-key line such as `ssh-ed25519 BASE64 comment`.
+pub fn parse_public_key_line(source: &str) -> anyhow::Result<PublicKey> {
+    let mut fields = source.split_whitespace();
+    let first = fields.next().context("public-key line must not be empty")?;
+    let encoded = if first.starts_with("ssh-")
+        || first.starts_with("ecdsa-")
+        || first.starts_with("sk-")
+        || first.starts_with("rsa-sha2-")
+    {
+        fields
+            .next()
+            .context("OpenSSH public-key line is missing its Base64 key")?
+    } else {
+        first
+    };
+    keys::parse_public_key_base64(encoded).context("invalid Base64 SSH public key")
 }
 
 fn ensure_not_served(file: &Path, root: &Path, what: &str) -> anyhow::Result<()> {

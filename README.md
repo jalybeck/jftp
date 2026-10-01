@@ -2,7 +2,7 @@
 
 **jftp** stands for **JSONL File Transfer Protocol**. It is a stateful file transfer and remote file management protocol carried over an authenticated SSH `jftp` subsystem. Control commands, listings, search results, and progress updates use JSON Lines (one JSON object per line); file contents stream as raw bytes in bounded chunks. SSH transport, key exchange, encryption, and signature verification are handled by `russh`.
 
-This package provides two binaries: `jftp-server`, which serves a configured directory, and `jftp`, which connects to the server for interactive or command-driven use.
+This package provides three binaries: `jftp-server` serves a configured directory, `jftp-server-admin` manages the server's local user configuration, and `jftp` connects for interactive or command-driven use.
 
 ## Build
 
@@ -10,9 +10,9 @@ This package provides two binaries: `jftp-server`, which serves a configured dir
 cargo build --release
 ```
 
-This creates `jftp-server` and `jftp` in Cargo's release output directory.
+This creates `jftp-server`, `jftp-server-admin`, and `jftp` in Cargo's release output directory.
 
-## Configure the server
+## Create a server user
 
 Create an Ed25519 client key if you do not already have one:
 
@@ -20,12 +20,28 @@ Create an Ed25519 client key if you do not already have one:
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
 ```
 
-Copy `users.example.toml` to the server's jftp config directory. Copy the public key line from the client's `id_ed25519.pub` into a file named `alice.pub` beside `users.toml`:
+Create the directory the server will expose, then add a user from the machine where the server configuration is stored:
 
-- Linux/macOS: `$XDG_CONFIG_HOME/jftp/users.toml`, or `~/.config/jftp/users.toml`
-- Windows: `%APPDATA%\jftp\users.toml`
+```sh
+mkdir -p ./shared
+jftp-server-admin add-user alice --public-key ~/.ssh/id_ed25519.pub --root ./shared --home alice --write --delete
+```
 
-The server config, referenced public-key files, and SSH host private key must stay outside the served `--path`. By default the host key is created once in the same config directory and reused on later starts. The initial server run prints its SHA-256 host key fingerprint and OpenSSH public key.
+On Windows PowerShell, use:
+
+```powershell
+New-Item -ItemType Directory -Force .\shared
+jftp-server-admin add-user alice --public-key "$env:USERPROFILE\.ssh\id_ed25519.pub" --root .\shared --home alice --write --delete
+```
+
+`--public-key` points to the client `.pub` file; the admin tool validates that it contains Ed25519 public keys, then copies them into its managed key directory and updates `users.toml` (creating the file if needed). The private key stays on the client. `--root` must match the server's `--path`; when `--home` names a subdirectory, `--root` is required and the tool creates the home directory if needed. Read access is enabled by default; pass `--write` and `--delete` only when those permissions are needed. Use `--no-read` to disable read access.
+
+By default, the admin tool and server use the same per-user config directory:
+
+- Linux/macOS: `$XDG_CONFIG_HOME/jftp`, or `~/.config/jftp`
+- Windows: `%APPDATA%\jftp`
+
+If you use a custom users file, pass the same `--users <file>` path to both commands. Use an absolute path if you run the commands from different working directories. For example, `jftp-server-admin --users ./config/users.toml add-user ...` and `jftp-server --users ./config/users.toml ...`. The users file, managed public-key files, and SSH host private key must stay outside the served `--path`. The admin tool checks this when you pass `--root`; the server always checks it at startup.
 
 Start the server:
 
@@ -35,7 +51,25 @@ jftp-server --port 2222 --path ./shared
 
 `--path` defaults to the process's current working directory. `home` in `users.toml` is a relative directory below `--path`; each account is confined to that canonical home directory. Absolute client paths are virtual paths from that home, so `/` means the account's home.
 
-Example account:
+The server reads `users.toml` at startup. Restart it after adding or updating a user so the changes take effect. `jftp-server-admin` is a local configuration tool; it does not add a remote user-management command to the SSH protocol.
+
+## List and update users
+
+List configured accounts, their home directories, permissions, and public-key fingerprints:
+
+```powershell
+.\jftp-server-admin list-users
+```
+
+Update only the fields you specify. For example, change a user's home and grant write access:
+
+```powershell
+.\jftp-server-admin update-user jari --root C:\tmp --home jftp-users\jari --write
+```
+
+Change permissions with `--read`/`--no-read`, `--write`/`--no-write`, and `--delete`/`--no-delete`. Rotate the user's accepted keys by passing `--public-key <file>`; this replaces the previous authorized key list. Changing `--home` requires `--root`, which must match the server's `--path`; the new home is created if it does not exist.
+
+Example account when configuring `users.toml` by hand:
 
 ```toml
 [[users]]
@@ -55,7 +89,9 @@ The `--users` and `--host-key` flags can select other paths; the server rejects 
 
 ## Trust the server host key
 
-Before connecting, add a known server host key to the client's OpenSSH `known_hosts` file. Verify the fingerprint printed by the server through a trusted channel before accepting the key. For a non-default port, a known-hosts line has this form:
+On first connection, `jftp` shows the server key fingerprint and asks whether to trust it. Verify the fingerprint through a trusted channel before answering `yes`; accepted keys are added to the client's OpenSSH `known_hosts` file. A declined prompt does not save the key. If a previously trusted host presents a different key, the client refuses the connection and requires you to verify and update `known_hosts` manually.
+
+For a non-default port, the saved known-hosts line has this form:
 
 ```text
 [server.example]:2222 ssh-ed25519 BASE64_KEY
