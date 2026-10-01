@@ -109,7 +109,9 @@ Open an interactive session (CWD persists for this SSH connection):
 jftp server.example --port 2222 --user alice
 ```
 
-The client defaults to `~/.ssh/id_ed25519`; choose another Ed25519 identity with `--identity`. Encrypted keys prompt for their passphrase. Interactive commands are `list`, `search`, `cd`, `pwd`, `mkdir`, `rm`, `upload`, `download`, and `exit`. Press Ctrl+C during `rm` to request cancellation while the server streams per-item progress.
+The client defaults to `~/.ssh/id_ed25519`; choose another Ed25519 identity with `--identity`. Encrypted keys prompt for their passphrase. Interactive remote commands are `list`, `search`, `cd`, `pwd`, `mkdir`, `rm`, `upload`, and `download`. Use `exit` to close the session. Press Ctrl+C during `rm` to request cancellation while the server streams per-item progress.
+
+For local files, use `lpwd` to show the current directory, `lcd <path>` to change it, and `llist [path]` to list a directory. Relative local paths in `upload` and `download` use the directory selected by `lcd`; absolute local paths still work. The local directory changes only for the current client session.
 
 In an interactive session, `help` groups the commands and `help <command>` shows one command's syntax. Listings use readable file sizes. Colors appear when the terminal supports them; set `NO_COLOR` (or `CLICOLOR=0`) to disable colors. Redirected output is plain text, and transfer progress updates appear only in an interactive terminal.
 

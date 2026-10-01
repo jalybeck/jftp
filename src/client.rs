@@ -38,12 +38,15 @@ pub struct ConnectionOptions {
 #[derive(Debug, Clone)]
 pub enum ClientCommand {
     List { path: Option<String> },
+    LocalList { path: Option<PathBuf> },
     Rm { path: String, recursive: bool },
     Upload { local: PathBuf, remote: String },
     Download { remote: String, local: PathBuf },
     Search { query: String, path: Option<String> },
     Pwd,
+    LocalPwd,
     Cd { path: String },
+    LocalCd { path: PathBuf },
     Mkdir { path: String },
 }
 
@@ -237,6 +240,7 @@ pub struct ClientSession<R, W> {
     reader: BufReader<R>,
     writer: W,
     cwd: String,
+    local_cwd: PathBuf,
     _ssh: client::Handle<JftpClientHandler>,
 }
 
@@ -257,6 +261,10 @@ where
                 self.send_request(&request).await?;
                 self.read_stream(&id, false, OutputKind::List).await?;
             }
+            ClientCommand::LocalList { path } => {
+                let directory = resolve_local_path(&self.local_cwd, path.as_deref());
+                list_local_directory(&directory).await?;
+            }
             ClientCommand::Search { query, path } => {
                 print_listing_header(&query, true);
                 let id = Uuid::new_v4().to_string();
@@ -275,19 +283,30 @@ where
                 .await?;
                 self.read_stream(&id, true, OutputKind::Remove).await?;
             }
-            ClientCommand::Upload { local, remote } => self.upload(&local, &remote).await?,
-            ClientCommand::Download { remote, local } => self.download(&remote, &local).await?,
+            ClientCommand::Upload { local, remote } => {
+                let local = resolve_local_path(&self.local_cwd, Some(&local));
+                self.upload(&local, &remote).await?;
+            }
+            ClientCommand::Download { remote, local } => {
+                let local = resolve_local_path(&self.local_cwd, Some(&local));
+                self.download(&remote, &local).await?;
+            }
             ClientCommand::Pwd => {
                 let id = Uuid::new_v4().to_string();
                 self.send_request(&json!({"id":id, "command":"pwd"}))
                     .await?;
                 self.read_stream(&id, false, OutputKind::Other).await?;
             }
+            ClientCommand::LocalPwd => println!("{}", display_local_path(&self.local_cwd)),
             ClientCommand::Cd { path } => {
                 let id = Uuid::new_v4().to_string();
                 self.send_request(&json!({"id":id, "command":"cd", "path":path}))
                     .await?;
                 self.read_stream(&id, false, OutputKind::Other).await?;
+            }
+            ClientCommand::LocalCd { path } => {
+                self.local_cwd = change_local_directory(&self.local_cwd, &path).await?;
+                println!("{}", display_local_path(&self.local_cwd));
             }
             ClientCommand::Mkdir { path } => {
                 let id = Uuid::new_v4().to_string();
@@ -460,7 +479,7 @@ where
         }
         self.writer.flush().await?;
         self.read_stream(&id, false, OutputKind::Transfer).await?;
-        print_transfer_done("Uploaded", &local.display().to_string(), remote, size);
+        print_transfer_done("Uploaded", &display_local_path(local), remote, size);
         Ok(())
     }
 
@@ -531,7 +550,7 @@ where
             let _ = fs::remove_file(&temporary).await;
         }
         transfer_result?;
-        print_transfer_done("Downloaded", remote, &local.display().to_string(), size);
+        print_transfer_done("Downloaded", remote, &display_local_path(local), size);
         Ok(())
     }
 }
@@ -633,6 +652,83 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn resolve_local_path(cwd: &Path, path: Option<&Path>) -> PathBuf {
+    match path {
+        None => cwd.to_path_buf(),
+        Some(path) if path.is_absolute() => path.to_path_buf(),
+        Some(path) => cwd.join(path),
+    }
+}
+
+fn display_local_path(path: &Path) -> String {
+    let displayed = path.display().to_string();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = displayed.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(drive) = displayed.strip_prefix(r"\\?\") {
+            return drive.to_owned();
+        }
+    }
+    displayed
+}
+
+async fn change_local_directory(cwd: &Path, path: &Path) -> anyhow::Result<PathBuf> {
+    let target = resolve_local_path(cwd, Some(path));
+    let target = fs::canonicalize(&target)
+        .await
+        .with_context(|| format!("cannot open local directory {}", target.display()))?;
+    if !fs::metadata(&target).await?.is_dir() {
+        bail!("not a local directory: {}", target.display());
+    }
+    Ok(target)
+}
+
+async fn list_local_directory(directory: &Path) -> anyhow::Result<()> {
+    let mut reader = fs::read_dir(directory)
+        .await
+        .with_context(|| format!("cannot list local directory {}", directory.display()))?;
+    let mut entries = Vec::new();
+    while let Some(entry) = reader.next_entry().await? {
+        entries.push(entry);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+
+    print_listing_header(&format!("(local) {}", display_local_path(directory)), false);
+    let mut count = 0_u64;
+    for entry in &entries {
+        let metadata = match fs::symlink_metadata(entry.path()).await {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                eprintln!(
+                    "{}: cannot read {}: {error}",
+                    paint("warning", "33", true),
+                    display_local_path(&entry.path())
+                );
+                continue;
+            }
+        };
+        let kind = if metadata.file_type().is_symlink() {
+            "symlink"
+        } else if metadata.is_dir() {
+            "directory"
+        } else if metadata.is_file() {
+            "file"
+        } else {
+            "other"
+        };
+        print_listing_row(
+            kind,
+            Some(metadata.len()),
+            &entry.file_name().to_string_lossy(),
+        );
+        count += 1;
+    }
+    print_item_count(count);
+    Ok(())
+}
+
 fn terminal_supports_color(
     is_terminal: bool,
     no_color: bool,
@@ -718,6 +814,23 @@ const NAV_COMMANDS: &[CommandHelp] = &[
         description: "Create a remote directory",
     },
 ];
+const LOCAL_COMMANDS: &[CommandHelp] = &[
+    CommandHelp {
+        name: "lpwd",
+        usage: "lpwd",
+        description: "Show the local directory",
+    },
+    CommandHelp {
+        name: "lcd",
+        usage: "lcd <path>",
+        description: "Change the local directory",
+    },
+    CommandHelp {
+        name: "llist",
+        usage: "llist [path]",
+        description: "List a local directory",
+    },
+];
 const OTHER_COMMANDS: &[CommandHelp] = &[
     CommandHelp {
         name: "rm",
@@ -741,10 +854,51 @@ const OTHER_COMMANDS: &[CommandHelp] = &[
     },
 ];
 
+#[cfg(windows)]
+fn split_interactive_command(line: &str) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut in_word = false;
+    for character in line.chars() {
+        match (quote, character) {
+            (Some(delimiter), character) if character == delimiter => quote = None,
+            (Some(_), character) => current.push(character),
+            (None, '"' | '\'') => {
+                quote = Some(character);
+                in_word = true;
+            }
+            (None, character) if character.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut current));
+                    in_word = false;
+                }
+            }
+            (None, character) => {
+                current.push(character);
+                in_word = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err("unterminated quoted argument".to_owned());
+    }
+    if in_word {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+#[cfg(not(windows))]
+fn split_interactive_command(line: &str) -> Result<Vec<String>, String> {
+    shell_words::split(line).map_err(|error| error.to_string())
+}
+
 fn command_help(name: &str) -> Option<&'static CommandHelp> {
     FILE_COMMANDS
         .iter()
         .chain(NAV_COMMANDS)
+        .chain(LOCAL_COMMANDS)
         .chain(OTHER_COMMANDS)
         .find(|item| item.name == name)
 }
@@ -763,25 +917,32 @@ fn print_help(command: Option<&str>) {
         }
         return;
     }
-    println!("\n{}", paint("Files", "1", false));
+    println!("\n{}", paint("Remote files", "1", false));
     for item in FILE_COMMANDS {
         println!("  {:<27} {}", item.usage, item.description);
     }
-    println!("\n{}", paint("Navigation", "1", false));
+    println!("\n{}", paint("Remote navigation", "1", false));
     for item in NAV_COMMANDS {
+        println!("  {:<27} {}", item.usage, item.description);
+    }
+    println!("\n{}", paint("Local", "1", false));
+    for item in LOCAL_COMMANDS {
         println!("  {:<27} {}", item.usage, item.description);
     }
     println!("\n{}", paint("Other", "1", false));
     for item in OTHER_COMMANDS {
         println!("  {:<27} {}", item.usage, item.description);
     }
-    println!("\nUse help <command> for a command's syntax. Quote paths containing spaces.\n");
+    println!(
+        "\nUse help <command> for syntax. Relative local paths use lcd. Quote paths containing spaces.\n"
+    );
 }
 
 fn suggested_command(command: &str) -> Option<&'static str> {
     FILE_COMMANDS
         .iter()
         .chain(NAV_COMMANDS)
+        .chain(LOCAL_COMMANDS)
         .chain(OTHER_COMMANDS)
         .find(|item| item.name.starts_with(command) && command.len() >= 2)
         .map(|item| item.name)
@@ -820,6 +981,20 @@ fn print_listing_header(label: &str, search: bool) {
         let columns = format!("{:<10} {:>9}  {}", "TYPE", "SIZE", "NAME");
         println!("{}", paint(&columns, "2", false));
     }
+}
+
+fn print_listing_row(kind: &str, size: Option<u64>, name: &str) {
+    let size = if kind == "file" {
+        size.map(format_bytes).unwrap_or_else(|| "-".to_owned())
+    } else {
+        "-".to_owned()
+    };
+    println!("{kind:<10} {size:>9}  {}", paint(name, "36", false));
+}
+
+fn print_item_count(count: u64) {
+    let noun = if count == 1 { "item" } else { "items" };
+    println!("{} {count} {noun}\n", paint("--", "2", false));
 }
 
 fn print_transfer_done(verb: &str, source: &str, destination: &str, size: u64) {
@@ -864,13 +1039,7 @@ fn render_response(response: &Value, output: OutputKind) {
             if matches!(output, OutputKind::Search) {
                 println!("{kind:<10} {}", paint(path, "36", false));
             } else {
-                let size = response
-                    .get("size")
-                    .and_then(Value::as_u64)
-                    .map(format_bytes)
-                    .unwrap_or_else(|| "-".to_owned());
-                print!("{kind:<10} {size:>9}  ");
-                println!("{}", paint(name, "36", false));
+                print_listing_row(kind, response.get("size").and_then(Value::as_u64), name);
             }
         }
         "deleting" => println!("Deleting {file}"),
@@ -886,8 +1055,7 @@ fn render_response(response: &Value, output: OutputKind) {
         ),
         "done" => {
             if let Some(count) = response.get("count").and_then(Value::as_u64) {
-                let noun = if count == 1 { "item" } else { "items" };
-                println!("{} {count} {noun}\n", paint("--", "2", false));
+                print_item_count(count);
             }
             if let Some(deleted) = response.get("deleted").and_then(Value::as_u64) {
                 let noun = if deleted == 1 { "item" } else { "items" };
@@ -943,6 +1111,7 @@ pub async fn connect<R: ToSocketAddrs>(
         tokio::io::WriteHalf<russh::ChannelStream<client::Msg>>,
     >,
 > {
+    let local_cwd = std::env::current_dir().context("cannot determine local directory")?;
     let key_text = tokio::fs::read_to_string(&options.identity_file)
         .await
         .with_context(|| {
@@ -1013,6 +1182,7 @@ pub async fn connect<R: ToSocketAddrs>(
         reader: BufReader::new(reader),
         writer,
         cwd: "/".to_owned(),
+        local_cwd,
         _ssh: ssh,
     })
 }
@@ -1025,6 +1195,10 @@ where
     let stdin = tokio::io::stdin();
     let mut input = BufReader::new(stdin);
     println!("Connected. Remote directory: {}", session.cwd);
+    println!(
+        "Local directory: {}",
+        display_local_path(&session.local_cwd)
+    );
     println!("Type help for commands. Ctrl+C cancels rm; exit closes the session.\n");
     loop {
         print!(
@@ -1038,10 +1212,9 @@ where
         if input.read_line(&mut line).await? == 0 {
             break;
         }
-        // Windows consoles return CRLF; shell_words treats `\r` as part of
-        // the final token, which made commands such as `help` unrecognizable.
+        // Strip CRLF before tokenizing so the final command has no trailing CR.
         let command_line = line.trim_end_matches(['\r', '\n']);
-        let words = match shell_words::split(command_line) {
+        let words = match split_interactive_command(command_line) {
             Ok(words) => words,
             Err(error) => {
                 eprintln!("{}: {error}", paint("error", "31", true));
@@ -1066,13 +1239,20 @@ where
             "list" if words.len() <= 2 => Some(ClientCommand::List {
                 path: words.get(1).cloned(),
             }),
+            "llist" if words.len() <= 2 => Some(ClientCommand::LocalList {
+                path: words.get(1).map(PathBuf::from),
+            }),
             "search" if (2..=3).contains(&words.len()) => Some(ClientCommand::Search {
                 query: words[1].clone(),
                 path: words.get(2).cloned(),
             }),
             "pwd" if words.len() == 1 => Some(ClientCommand::Pwd),
+            "lpwd" if words.len() == 1 => Some(ClientCommand::LocalPwd),
             "cd" if words.len() == 2 => Some(ClientCommand::Cd {
                 path: words[1].clone(),
+            }),
+            "lcd" if words.len() == 2 => Some(ClientCommand::LocalCd {
+                path: PathBuf::from(&words[1]),
             }),
             "mkdir" if words.len() == 2 => Some(ClientCommand::Mkdir {
                 path: words[1].clone(),
@@ -1137,5 +1317,39 @@ mod tests {
     fn remote_errors_keep_the_affected_file() {
         let response = json!({"type":"error", "message":"permission denied", "file":"/report.txt"});
         assert_eq!(response_error(&response), "permission denied (/report.txt)");
+    }
+
+    #[tokio::test]
+    async fn local_directory_changes_validate_the_target() {
+        let cwd = std::env::current_dir().unwrap();
+        let selected = change_local_directory(&cwd, Path::new(".")).await.unwrap();
+        assert_eq!(selected, fs::canonicalize(&cwd).await.unwrap());
+        assert!(
+            change_local_directory(&cwd, &std::env::current_exe().unwrap())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            resolve_local_path(&selected, Some(Path::new("report.txt"))),
+            selected.join("report.txt")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_keep_backslashes_in_interactive_commands() {
+        assert_eq!(
+            split_interactive_command(r"lcd C:\tmp\files").unwrap(),
+            ["lcd", r"C:\tmp\files"]
+        );
+        assert_eq!(
+            split_interactive_command(r#"llist "C:\My Files""#).unwrap(),
+            ["llist", r"C:\My Files"]
+        );
+        assert_eq!(display_local_path(Path::new(r"\\?\C:\tmp")), r"C:\tmp");
+        assert_eq!(
+            display_local_path(Path::new(r"\\?\UNC\server\share")),
+            r"\\server\share"
+        );
     }
 }
