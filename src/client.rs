@@ -699,7 +699,11 @@ where
         if input.read_line(&mut line).await? == 0 {
             break;
         }
-        let words = match shell_words::split(&line) {
+        // Windows consoles return CRLF; shell_words treats `\r` as part of
+        // the final token, which made commands such as `help` unrecognizable.
+        let command_line =
+            line.trim_end_matches(|character| character == '\r' || character == '\n');
+        let words = match shell_words::split(command_line) {
             Ok(words) => words,
             Err(error) => {
                 eprintln!("{error}");
