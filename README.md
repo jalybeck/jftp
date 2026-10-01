@@ -20,12 +20,12 @@ Create an Ed25519 client key if you do not already have one:
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519
 ```
 
-Copy `users.example.toml` to the server's jftp config directory and replace the example public key with the contents of `id_ed25519.pub`:
+Copy `users.example.toml` to the server's jftp config directory. Copy the public key line from the client's `id_ed25519.pub` into a file named `alice.pub` beside `users.toml`:
 
 - Linux/macOS: `$XDG_CONFIG_HOME/jftp/users.toml`, or `~/.config/jftp/users.toml`
 - Windows: `%APPDATA%\jftp\users.toml`
 
-The server config and SSH host private key must stay outside the served `--path`. By default the host key is created once in the same config directory and reused on later starts. The initial server run prints its SHA-256 host key fingerprint and OpenSSH public key.
+The server config, referenced public-key files, and SSH host private key must stay outside the served `--path`. By default the host key is created once in the same config directory and reused on later starts. The initial server run prints its SHA-256 host key fingerprint and OpenSSH public key.
 
 Start the server:
 
@@ -41,7 +41,7 @@ Example account:
 [[users]]
 name = "alice"
 home = "."
-authorized_keys = ["ssh-ed25519 AAAAC3... alice@client"]
+authorized_keys_file = "alice.pub"
 
 [users.permissions]
 read = true
@@ -50,6 +50,8 @@ delete = true
 ```
 
 The `--users` and `--host-key` flags can select other paths; the server rejects those files if they are under the served root. Password authentication is disabled. Only Ed25519 user keys are accepted.
+
+`authorized_keys_file` may be an absolute path or a path relative to `users.toml`. It accepts one OpenSSH public key per line; blank lines and lines beginning with `#` are ignored. The server loads the file at startup. For small setups, you can still put keys directly in `authorized_keys = ["ssh-ed25519 ..."]` instead.
 
 ## Trust the server host key
 

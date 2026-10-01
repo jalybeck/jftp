@@ -46,7 +46,10 @@ struct UserConfig {
     name: String,
     #[serde(default = "default_home")]
     home: PathBuf,
+    #[serde(default)]
     authorized_keys: Vec<String>,
+    #[serde(default)]
+    authorized_keys_file: Option<PathBuf>,
     #[serde(default)]
     permissions: Permissions,
 }
@@ -169,22 +172,57 @@ pub async fn run(
                 config.name
             );
         }
-        if config.authorized_keys.is_empty() {
-            bail!(
-                "user {:?} must have at least one Ed25519 authorized key",
-                config.name
-            );
-        }
         let mut authorized_keys = Vec::new();
         for source in config.authorized_keys {
-            let key = keys::parse_public_key_base64(source.trim())
-                .with_context(|| format!("invalid authorized key for user {:?}", config.name))?;
-            if key.algorithm() != Algorithm::Ed25519 {
-                bail!("user {:?} has a non-Ed25519 authorized key", config.name);
+            add_authorized_key(&mut authorized_keys, source.trim(), &config.name)?;
+        }
+        if let Some(key_file) = config.authorized_keys_file {
+            let key_file = if key_file.is_absolute() {
+                key_file
+            } else {
+                users_path
+                    .parent()
+                    .context("users file has no parent directory")?
+                    .join(key_file)
+            };
+            let key_file = tokio::fs::canonicalize(&key_file).await.with_context(|| {
+                format!(
+                    "cannot resolve authorized keys file for user {:?}: {}",
+                    config.name,
+                    key_file.display()
+                )
+            })?;
+            ensure_not_served(&key_file, &root_directory, "authorized keys file")?;
+            let contents = tokio::fs::read_to_string(&key_file)
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot read authorized keys file for user {:?}: {}",
+                        config.name,
+                        key_file.display()
+                    )
+                })?;
+            for (line_index, line) in contents.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                add_authorized_key(&mut authorized_keys, line, &config.name).with_context(
+                    || {
+                        format!(
+                            "invalid key on line {} of {}",
+                            line_index + 1,
+                            key_file.display()
+                        )
+                    },
+                )?;
             }
-            if !authorized_keys.contains(&key) {
-                authorized_keys.push(key);
-            }
+        }
+        if authorized_keys.is_empty() {
+            bail!(
+                "user {:?} must specify at least one Ed25519 key using authorized_keys or authorized_keys_file",
+                config.name
+            );
         }
         let account = UserAccount {
             name: config.name.clone(),
@@ -229,6 +267,22 @@ pub async fn run(
 
     let mut server = JftpServer { context };
     server.run_on_address(config, ("0.0.0.0", port)).await?;
+    Ok(())
+}
+
+fn add_authorized_key(
+    authorized_keys: &mut Vec<PublicKey>,
+    source: &str,
+    username: &str,
+) -> anyhow::Result<()> {
+    let key = keys::parse_public_key_base64(source)
+        .with_context(|| format!("invalid authorized key for user {username:?}"))?;
+    if key.algorithm() != Algorithm::Ed25519 {
+        bail!("user {username:?} has a non-Ed25519 authorized key");
+    }
+    if !authorized_keys.contains(&key) {
+        authorized_keys.push(key);
+    }
     Ok(())
 }
 

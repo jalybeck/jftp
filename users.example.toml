@@ -1,10 +1,10 @@
 # Copy this file to the server's per-user jftp config directory as users.toml.
-# Replace the authorized_keys value with the contents of the client's .pub file.
+# Copy the client's public key line into alice.pub beside users.toml.
 
 [[users]]
 name = "alice"
 home = "."
-authorized_keys = ["ssh-ed25519 REPLACE_WITH_CLIENT_PUBLIC_KEY alice@client"]
+authorized_keys_file = "alice.pub"
 
 [users.permissions]
 read = true
