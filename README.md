@@ -4,13 +4,33 @@
 
 This package provides three binaries: `jftp-server` serves a configured directory, `jftp-server-admin` manages the server's local user configuration, and `jftp` connects for interactive or command-driven use.
 
+## Downloads
+
+The latest automatically built packages contain all three binaries. Pushing a new Git tag builds the Windows and Linux packages, publishes them as a GitHub release, and updates this table. Older releases and their tags are removed.
+
+<!-- BUILD_TABLE_START -->
+| Package | Platform | Built |
+| --- | --- | --- |
+| [jftp_win_x64.zip](https://github.com/jalybeck/jftp/releases/latest/download/jftp_win_x64.zip) | Windows x64 | After first tagged build |
+| [jftp_linux_x64.tar.gz](https://github.com/jalybeck/jftp/releases/latest/download/jftp_linux_x64.tar.gz) | Linux x64 | After first tagged build |
+<!-- BUILD_TABLE_END -->
+
+Download the package for your platform and extract it. The three executables are in the archive's root.
+
 ## Build
 
 ```powershell
-cargo build --release
+cargo build --release --locked --bins
 ```
 
 This creates `jftp-server`, `jftp-server-admin`, and `jftp` in Cargo's release output directory.
+
+To publish a new download package, push a new tag, for example:
+
+```sh
+git tag build-2026-10-01
+git push origin build-2026-10-01
+```
 
 ## Create a server user
 
