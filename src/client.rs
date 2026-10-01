@@ -1,7 +1,7 @@
 use std::{
-    io::{SeekFrom, Write as IoWrite},
+    io::{IsTerminal, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -45,6 +45,15 @@ pub enum ClientCommand {
     Pwd,
     Cd { path: String },
     Mkdir { path: String },
+}
+
+#[derive(Clone, Copy)]
+enum OutputKind {
+    List,
+    Search,
+    Remove,
+    Transfer,
+    Other,
 }
 
 pub fn default_ssh_directory() -> anyhow::Result<PathBuf> {
@@ -239,22 +248,24 @@ where
     pub async fn run_command(&mut self, command: ClientCommand) -> anyhow::Result<bool> {
         match command {
             ClientCommand::List { path } => {
+                print_listing_header(path.as_deref().unwrap_or(&self.cwd), false);
                 let id = Uuid::new_v4().to_string();
                 let mut request = json!({"id":id, "command":"list"});
                 if let Some(path) = path {
                     request["path"] = json!(path);
                 }
                 self.send_request(&request).await?;
-                self.read_stream(&id, false).await?;
+                self.read_stream(&id, false, OutputKind::List).await?;
             }
             ClientCommand::Search { query, path } => {
+                print_listing_header(&query, true);
                 let id = Uuid::new_v4().to_string();
                 let mut request = json!({"id":id, "command":"search", "query":query});
                 if let Some(path) = path {
                     request["path"] = json!(path);
                 }
                 self.send_request(&request).await?;
-                self.read_stream(&id, false).await?;
+                self.read_stream(&id, false, OutputKind::Search).await?;
             }
             ClientCommand::Rm { path, recursive } => {
                 let id = Uuid::new_v4().to_string();
@@ -262,7 +273,7 @@ where
                     &json!({"id":id, "command":"rm", "path":path, "recursive":recursive}),
                 )
                 .await?;
-                self.read_stream(&id, true).await?;
+                self.read_stream(&id, true, OutputKind::Remove).await?;
             }
             ClientCommand::Upload { local, remote } => self.upload(&local, &remote).await?,
             ClientCommand::Download { remote, local } => self.download(&remote, &local).await?,
@@ -270,19 +281,19 @@ where
                 let id = Uuid::new_v4().to_string();
                 self.send_request(&json!({"id":id, "command":"pwd"}))
                     .await?;
-                self.read_stream(&id, false).await?;
+                self.read_stream(&id, false, OutputKind::Other).await?;
             }
             ClientCommand::Cd { path } => {
                 let id = Uuid::new_v4().to_string();
                 self.send_request(&json!({"id":id, "command":"cd", "path":path}))
                     .await?;
-                self.read_stream(&id, false).await?;
+                self.read_stream(&id, false, OutputKind::Other).await?;
             }
             ClientCommand::Mkdir { path } => {
                 let id = Uuid::new_v4().to_string();
                 self.send_request(&json!({"id":id, "command":"mkdir", "path":path}))
                     .await?;
-                self.read_stream(&id, false).await?;
+                self.read_stream(&id, false, OutputKind::Other).await?;
             }
         }
         Ok(true)
@@ -305,12 +316,18 @@ where
             .context("server sent an invalid JSONL response")
     }
 
-    async fn read_stream(&mut self, request_id: &str, cancellable: bool) -> anyhow::Result<()> {
-        let mut first_error: Option<String> = None;
+    async fn read_stream(
+        &mut self,
+        request_id: &str,
+        cancellable: bool,
+        output: OutputKind,
+    ) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        let mut error_count = 0_usize;
         let mut cancel_signal = Box::pin(tokio::signal::ctrl_c());
         let mut cancel_sent = false;
         loop {
-            let response = if cancellable && !cancel_sent {
+            let mut response = if cancellable && !cancel_sent {
                 tokio::select! {
                     response = self.next_response() => response?,
                     signal = &mut cancel_signal => {
@@ -331,33 +348,39 @@ where
             {
                 // The cancel acknowledgement has its own request ID. Show it,
                 // then keep consuming the original deletion stream.
-                render_response(&response);
+                render_response(&response, output);
                 continue;
             }
             if response.get("type").and_then(Value::as_str) == Some("error") {
-                first_error.get_or_insert_with(|| {
-                    response
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("remote error")
-                        .to_owned()
-                });
-            }
-            if response.get("type").and_then(Value::as_str) == Some("cwd") {
-                if let Some(path) = response.get("path").and_then(Value::as_str) {
-                    self.cwd = path.to_owned();
+                error_count += 1;
+                if errors.len() < 10 {
+                    errors.push(response_error(&response));
                 }
             }
-            render_response(&response);
+            if error_count > 0 && response.get("type").and_then(Value::as_str) == Some("done") {
+                response["had_errors"] = json!(true);
+            }
+            if response.get("type").and_then(Value::as_str) == Some("cwd")
+                && let Some(path) = response.get("path").and_then(Value::as_str)
+            {
+                self.cwd = path.to_owned();
+            }
+            if response.get("type").and_then(Value::as_str) != Some("error") {
+                render_response(&response, output);
+            }
             let event_type = response
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if event_type == "done" || event_type == "cancelled" {
-                if response.get("ok").and_then(Value::as_bool) == Some(false) {
-                    if let Some(message) = first_error {
-                        bail!("{message}");
+                if error_count > 0 {
+                    let omitted = error_count - errors.len();
+                    if omitted > 0 {
+                        errors.push(format!("and {omitted} more errors"));
                     }
+                    bail!("{}", errors.join("\n"));
+                }
+                if response.get("ok").and_then(Value::as_bool) == Some(false) {
                     bail!("remote command failed");
                 }
                 if response.get("had_errors").and_then(Value::as_bool) == Some(true) {
@@ -380,7 +403,7 @@ where
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             if response_id != id {
-                render_response(&response);
+                render_response(&response, OutputKind::Other);
                 continue;
             }
             if event_type == "error" {
@@ -395,7 +418,7 @@ where
             if event_type == "ready" {
                 return Ok(response);
             }
-            render_response(&response);
+            render_response(&response, OutputKind::Other);
             if event_type == "done" {
                 bail!("server finished before beginning the transfer");
             }
@@ -436,7 +459,8 @@ where
             progress.advance(read as u64);
         }
         self.writer.flush().await?;
-        self.read_stream(&id, false).await?;
+        self.read_stream(&id, false, OutputKind::Transfer).await?;
+        print_transfer_done("Uploaded", &local.display().to_string(), remote, size);
         Ok(())
     }
 
@@ -496,10 +520,10 @@ where
             let response = self.next_response().await?;
             if response.get("id").and_then(Value::as_str) != Some(id.as_str())
                 || response.get("type").and_then(Value::as_str) != Some("done")
+                || response.get("ok").and_then(Value::as_bool) == Some(false)
             {
                 bail!("server did not finish the download cleanly");
             }
-            render_response(&response);
             Ok::<(), anyhow::Error>(())
         }
         .await;
@@ -507,7 +531,7 @@ where
             let _ = fs::remove_file(&temporary).await;
         }
         transfer_result?;
-        println!("saved {} bytes to {}", size, local.display());
+        print_transfer_done("Downloaded", remote, &local.display().to_string(), size);
         Ok(())
     }
 }
@@ -520,6 +544,7 @@ struct TransferProgress {
     transferred: u64,
     last_draw: Instant,
     line_open: bool,
+    interactive: bool,
 }
 
 impl TransferProgress {
@@ -529,15 +554,20 @@ impl TransferProgress {
             total,
             transferred: 0,
             last_draw: Instant::now(),
-            line_open: true,
+            line_open: false,
+            interactive: std::io::stderr().is_terminal(),
         };
-        progress.draw();
+        if progress.interactive {
+            progress.draw();
+        }
         progress
     }
 
     fn advance(&mut self, bytes: u64) {
         self.transferred = self.transferred.saturating_add(bytes).min(self.total);
-        if self.transferred == self.total || self.last_draw.elapsed().as_millis() >= 100 {
+        if self.interactive
+            && (self.transferred == self.total || self.last_draw.elapsed().as_millis() >= 100)
+        {
             self.draw();
         }
     }
@@ -560,6 +590,7 @@ impl TransferProgress {
             "-".repeat(PROGRESS_BAR_WIDTH - filled)
         );
         let mut stderr = std::io::stderr().lock();
+        self.line_open = true;
         let _ = write!(
             stderr,
             "\r{} [{bar}] {:3.0}% {} / {}",
@@ -602,7 +633,215 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn render_response(response: &Value) {
+fn terminal_supports_color(
+    is_terminal: bool,
+    no_color: bool,
+    clicolor: Option<&str>,
+    term: Option<&str>,
+    windows_ansi: bool,
+) -> bool {
+    is_terminal && !no_color && clicolor != Some("0") && term != Some("dumb") && windows_ansi
+}
+
+fn color_enabled(stderr: bool) -> bool {
+    static STDOUT_COLOR: OnceLock<bool> = OnceLock::new();
+    static STDERR_COLOR: OnceLock<bool> = OnceLock::new();
+    *if stderr { &STDERR_COLOR } else { &STDOUT_COLOR }.get_or_init(|| detect_color(stderr))
+}
+
+fn detect_color(stderr: bool) -> bool {
+    let is_terminal = if stderr {
+        std::io::stderr().is_terminal()
+    } else {
+        std::io::stdout().is_terminal()
+    };
+    let clicolor = std::env::var("CLICOLOR").ok();
+    let term = std::env::var("TERM").ok();
+    // Be conservative on Windows consoles where ANSI support is unknown.
+    let windows_ansi = !cfg!(windows)
+        || std::env::var_os("WT_SESSION").is_some()
+        || std::env::var_os("ANSICON").is_some()
+        || std::env::var("ConEmuANSI").is_ok_and(|value| value == "ON")
+        || std::env::var_os("TERM_PROGRAM").is_some()
+        || term.as_deref().is_some_and(|value| value != "dumb");
+    terminal_supports_color(
+        is_terminal,
+        std::env::var_os("NO_COLOR").is_some(),
+        clicolor.as_deref(),
+        term.as_deref(),
+        windows_ansi,
+    )
+}
+
+struct CommandHelp {
+    name: &'static str,
+    usage: &'static str,
+    description: &'static str,
+}
+
+const FILE_COMMANDS: &[CommandHelp] = &[
+    CommandHelp {
+        name: "list",
+        usage: "list [path]",
+        description: "List a remote directory",
+    },
+    CommandHelp {
+        name: "search",
+        usage: "search <text> [path]",
+        description: "Find names recursively",
+    },
+    CommandHelp {
+        name: "upload",
+        usage: "upload <local> <remote>",
+        description: "Upload a file",
+    },
+    CommandHelp {
+        name: "download",
+        usage: "download <remote> <local>",
+        description: "Download a file",
+    },
+];
+const NAV_COMMANDS: &[CommandHelp] = &[
+    CommandHelp {
+        name: "pwd",
+        usage: "pwd",
+        description: "Show the remote directory",
+    },
+    CommandHelp {
+        name: "cd",
+        usage: "cd <path>",
+        description: "Change the remote directory",
+    },
+    CommandHelp {
+        name: "mkdir",
+        usage: "mkdir <path>",
+        description: "Create a remote directory",
+    },
+];
+const OTHER_COMMANDS: &[CommandHelp] = &[
+    CommandHelp {
+        name: "rm",
+        usage: "rm <glob>",
+        description: "Delete matching remote files",
+    },
+    CommandHelp {
+        name: "help",
+        usage: "help [command]",
+        description: "Show command help",
+    },
+    CommandHelp {
+        name: "exit",
+        usage: "exit",
+        description: "Close the session",
+    },
+    CommandHelp {
+        name: "quit",
+        usage: "quit",
+        description: "Close the session",
+    },
+];
+
+fn command_help(name: &str) -> Option<&'static CommandHelp> {
+    FILE_COMMANDS
+        .iter()
+        .chain(NAV_COMMANDS)
+        .chain(OTHER_COMMANDS)
+        .find(|item| item.name == name)
+}
+
+fn print_help(command: Option<&str>) {
+    if let Some(command) = command {
+        if let Some(item) = command_help(command) {
+            println!(
+                "\n{}\n  {}\n  {}\n",
+                paint("Usage", "1", false),
+                item.usage,
+                item.description
+            );
+        } else {
+            print_command_error(command);
+        }
+        return;
+    }
+    println!("\n{}", paint("Files", "1", false));
+    for item in FILE_COMMANDS {
+        println!("  {:<27} {}", item.usage, item.description);
+    }
+    println!("\n{}", paint("Navigation", "1", false));
+    for item in NAV_COMMANDS {
+        println!("  {:<27} {}", item.usage, item.description);
+    }
+    println!("\n{}", paint("Other", "1", false));
+    for item in OTHER_COMMANDS {
+        println!("  {:<27} {}", item.usage, item.description);
+    }
+    println!("\nUse help <command> for a command's syntax. Quote paths containing spaces.\n");
+}
+
+fn suggested_command(command: &str) -> Option<&'static str> {
+    FILE_COMMANDS
+        .iter()
+        .chain(NAV_COMMANDS)
+        .chain(OTHER_COMMANDS)
+        .find(|item| item.name.starts_with(command) && command.len() >= 2)
+        .map(|item| item.name)
+}
+
+fn print_command_error(command: &str) {
+    if let Some(item) = command_help(command) {
+        eprintln!("{}: usage: {}", paint("error", "31", true), item.usage);
+    } else if let Some(suggestion) = suggested_command(command) {
+        eprintln!(
+            "{}: unknown command {command:?}. Did you mean {suggestion:?}?",
+            paint("error", "31", true)
+        );
+    } else {
+        eprintln!(
+            "{}: unknown command {command:?}. Type help for commands.",
+            paint("error", "31", true)
+        );
+    }
+}
+
+fn paint(text: &str, code: &str, stderr: bool) -> String {
+    if color_enabled(stderr) {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+fn print_listing_header(label: &str, search: bool) {
+    if search {
+        println!("\n{} {}", paint("Search results for", "1", false), label);
+        println!("{}", paint("TYPE       PATH", "2", false));
+    } else {
+        println!("\n{} {}", paint("Listing", "1", false), label);
+        let columns = format!("{:<10} {:>9}  {}", "TYPE", "SIZE", "NAME");
+        println!("{}", paint(&columns, "2", false));
+    }
+}
+
+fn print_transfer_done(verb: &str, source: &str, destination: &str, size: u64) {
+    println!(
+        "{} {verb} {source} -> {destination} ({})",
+        paint("[ok]", "32", false),
+        format_bytes(size)
+    );
+}
+
+fn response_error(response: &Value) -> String {
+    let message = response
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("remote error");
+    match response.get("file").and_then(Value::as_str) {
+        Some(file) if !file.is_empty() => format!("{message} ({file})"),
+        _ => message.to_owned(),
+    }
+}
+
+fn render_response(response: &Value, output: OutputKind) {
     let event_type = response
         .get("type")
         .and_then(Value::as_str)
@@ -621,35 +860,25 @@ fn render_response(response: &Value) {
                 .get("kind")
                 .and_then(Value::as_str)
                 .unwrap_or("item");
-            let size = response
-                .get("size")
-                .and_then(Value::as_u64)
-                .map(|size| format!("  {size} B"))
-                .unwrap_or_default();
-            println!(
-                "{kind:9} {}{size}",
-                if path.is_empty() {
-                    response.get("name").and_then(Value::as_str).unwrap_or("")
-                } else {
-                    path
-                }
-            );
+            let name = response.get("name").and_then(Value::as_str).unwrap_or(path);
+            if matches!(output, OutputKind::Search) {
+                println!("{kind:<10} {}", paint(path, "36", false));
+            } else {
+                let size = response
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "-".to_owned());
+                print!("{kind:<10} {size:>9}  ");
+                println!("{}", paint(name, "36", false));
+            }
         }
-        "deleting" => println!("deleting {file}"),
-        "ready" => println!(
-            "{} ready ({} bytes)",
-            response
-                .get("transfer")
-                .and_then(Value::as_str)
-                .unwrap_or("transfer"),
-            response
-                .get("size")
-                .and_then(Value::as_u64)
-                .unwrap_or_default()
-        ),
+        "deleting" => println!("Deleting {file}"),
+        "ready" => {}
         "cwd" => println!("{path}"),
         "accepted" => println!(
-            "{}",
+            "{} {}",
+            paint("[info]", "36", false),
             response
                 .get("message")
                 .and_then(Value::as_str)
@@ -657,37 +886,49 @@ fn render_response(response: &Value) {
         ),
         "done" => {
             if let Some(count) = response.get("count").and_then(Value::as_u64) {
-                println!("{count} item(s)");
+                let noun = if count == 1 { "item" } else { "items" };
+                println!("{} {count} {noun}\n", paint("--", "2", false));
             }
             if let Some(deleted) = response.get("deleted").and_then(Value::as_u64) {
-                println!("deleted {deleted} item(s)");
+                let noun = if deleted == 1 { "item" } else { "items" };
+                let partial = response.get("had_errors").and_then(Value::as_bool) == Some(true)
+                    || response.get("ok").and_then(Value::as_bool) == Some(false);
+                let (label, color) = if partial {
+                    ("[partial]", "33")
+                } else {
+                    ("[ok]", "32")
+                };
+                println!("{} Deleted {deleted} {noun}", paint(label, color, false));
+            }
+            if matches!(output, OutputKind::Other) && !path.is_empty() {
+                println!("{} Created directory {path}", paint("[ok]", "32", false));
             }
         }
-        "cancelled" => println!(
-            "delete operation cancelled after {} item(s)",
-            response
+        "cancelled" => {
+            let deleted = response
                 .get("deleted")
                 .and_then(Value::as_u64)
-                .unwrap_or_default()
-        ),
-        "warning" => eprintln!(
-            "warning: {}",
-            response
+                .unwrap_or_default();
+            let noun = if deleted == 1 { "item" } else { "items" };
+            println!("Delete cancelled after {deleted} {noun}");
+        }
+        "warning" => {
+            let message = response
                 .get("message")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown issue")
-        ),
-        "error" => eprintln!(
-            "error: {}{}",
-            response
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("remote error"),
-            if file.is_empty() {
+                .unwrap_or("unknown issue");
+            let affected = if !file.is_empty() { file } else { path };
+            let detail = if affected.is_empty() {
                 String::new()
             } else {
-                format!(" ({file})")
-            }
+                format!(" ({affected})")
+            };
+            eprintln!("{}: {message}{detail}", paint("warning", "33", true));
+        }
+        "error" => eprintln!(
+            "{}: {}",
+            paint("error", "31", true),
+            response_error(response)
         ),
         other => println!("{other}: {response}"),
     }
@@ -783,11 +1024,14 @@ where
 {
     let stdin = tokio::io::stdin();
     let mut input = BufReader::new(stdin);
-    println!(
-        "Connected. Type help for commands; Ctrl+C cancels an active rm; exit closes the session."
-    );
+    println!("Connected. Remote directory: {}", session.cwd);
+    println!("Type help for commands. Ctrl+C cancels rm; exit closes the session.\n");
     loop {
-        print!("jftp:{}> ", session.cwd);
+        print!(
+            "{}:{}> ",
+            paint("jftp", "1", false),
+            paint(&session.cwd, "36", false)
+        );
         use std::io::Write;
         std::io::stdout().flush()?;
         let mut line = String::new();
@@ -796,25 +1040,26 @@ where
         }
         // Windows consoles return CRLF; shell_words treats `\r` as part of
         // the final token, which made commands such as `help` unrecognizable.
-        let command_line =
-            line.trim_end_matches(|character| character == '\r' || character == '\n');
+        let command_line = line.trim_end_matches(['\r', '\n']);
         let words = match shell_words::split(command_line) {
             Ok(words) => words,
             Err(error) => {
-                eprintln!("{error}");
+                eprintln!("{}: {error}", paint("error", "31", true));
                 continue;
             }
         };
         let Some(command) = words.first().map(String::as_str) else {
             continue;
         };
-        if command == "exit" || command == "quit" {
+        if (command == "exit" || command == "quit") && words.len() == 1 {
             break;
         }
         if command == "help" {
-            println!(
-                "list [path] | search <text> [path] | cd <path> | pwd | mkdir <path> | rm <glob> | upload <local> <remote> | download <remote> <local> | exit"
-            );
+            if words.len() <= 2 {
+                print_help(words.get(1).map(String::as_str));
+            } else {
+                print_command_error(command);
+            }
             continue;
         }
         let parsed = match command {
@@ -849,11 +1094,48 @@ where
         match parsed {
             Some(command) => {
                 if let Err(error) = session.run_command(command).await {
-                    eprintln!("{error:#}");
+                    eprintln!("{}: {error:#}", paint("error", "31", true));
                 }
             }
-            None => eprintln!("invalid command; type help for usage"),
+            None => print_command_error(command),
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_falls_back_for_non_terminal_and_disabled_environments() {
+        assert!(!terminal_supports_color(false, false, None, None, true));
+        assert!(!terminal_supports_color(true, true, None, None, true));
+        assert!(!terminal_supports_color(true, false, Some("0"), None, true));
+        assert!(!terminal_supports_color(
+            true,
+            false,
+            None,
+            Some("dumb"),
+            true
+        ));
+        assert!(!terminal_supports_color(true, false, None, None, false));
+        assert!(terminal_supports_color(true, false, None, None, true));
+    }
+
+    #[test]
+    fn command_feedback_uses_specific_syntax_and_suggestions() {
+        assert_eq!(
+            command_help("download").unwrap().usage,
+            "download <remote> <local>"
+        );
+        assert_eq!(suggested_command("lis"), Some("list"));
+        assert_eq!(suggested_command("unknown"), None);
+    }
+
+    #[test]
+    fn remote_errors_keep_the_affected_file() {
+        let response = json!({"type":"error", "message":"permission denied", "file":"/report.txt"});
+        assert_eq!(response_error(&response), "permission denied (/report.txt)");
+    }
 }

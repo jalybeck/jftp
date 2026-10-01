@@ -109,6 +109,8 @@ jftp server.example --port 2222 --user alice
 
 The client defaults to `~/.ssh/id_ed25519`; choose another Ed25519 identity with `--identity`. Encrypted keys prompt for their passphrase. Interactive commands are `list`, `search`, `cd`, `pwd`, `mkdir`, `rm`, `upload`, `download`, and `exit`. Press Ctrl+C during `rm` to request cancellation while the server streams per-item progress.
 
+In an interactive session, `help` groups the commands and `help <command>` shows one command's syntax. Listings use readable file sizes. Colors appear when the terminal supports them; set `NO_COLOR` (or `CLICOLOR=0`) to disable colors. Redirected output is plain text, and transfer progress updates appear only in an interactive terminal.
+
 Commands can also run in a single SSH session:
 
 ```sh
