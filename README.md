@@ -1,6 +1,8 @@
-# jftp
+# jftp — JSONL File Transfer Protocol
 
-`jftp-server` and `jftp` provide a stateful file transfer session over an SSH `jftp` subsystem. SSH transport, key exchange, encryption, and signature verification are handled by `russh`; application commands and progress use newline-delimited JSON.
+**jftp** stands for **JSONL File Transfer Protocol**. It is a stateful file transfer and remote file management protocol carried over an authenticated SSH `jftp` subsystem. Control commands, listings, search results, and progress updates use JSON Lines (one JSON object per line); file contents stream as raw bytes in bounded chunks. SSH transport, key exchange, encryption, and signature verification are handled by `russh`.
+
+This package provides two binaries: `jftp-server`, which serves a configured directory, and `jftp`, which connects to the server for interactive or command-driven use.
 
 ## Build
 
