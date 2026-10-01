@@ -585,28 +585,55 @@ impl JftpHandler {
             bail!("download source is not a regular file");
         }
         let size = metadata.len();
-        Self::send_json(handle, channel, &json!({"type":"ready", "id":request.id, "transfer":"download", "size":size, "path":paths.display(&resolved)})).await?;
-
-        let mut remaining = size;
-        let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
-        while remaining > 0 {
-            let length =
-                usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            file.read_exact(&mut buffer[..length])
-                .await
-                .context("download source changed during transfer; closing the SSH session")?;
-            handle
-                .data(channel, buffer[..length].to_vec())
-                .await
-                .map_err(|_| anyhow::anyhow!("SSH channel closed during download"))?;
-            remaining -= length as u64;
-        }
+        let id = request.id.clone();
+        let display_path = paths.display(&resolved);
         Self::send_json(
             handle,
             channel,
-            &json!({"type":"done", "id":request.id, "size":size}),
+            &json!({"type":"ready", "id":id, "transfer":"download", "size":size, "path":display_path}),
         )
         .await?;
+
+        // Handler::data runs on russh's session task. Sending the whole file
+        // through Handle::data here would fill that same task's bounded
+        // message queue and deadlock before it can drain the queued chunks.
+        // Stream from a separate task so russh can process window updates and
+        // outgoing data concurrently.
+        let transfer_handle = handle.clone();
+        tokio::spawn(async move {
+            let transfer_result = async {
+                let mut remaining = size;
+                let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
+                while remaining > 0 {
+                    let length =
+                        usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+                    file.read_exact(&mut buffer[..length])
+                        .await
+                        .context("download source changed during transfer")?;
+                    transfer_handle
+                        .data(channel, buffer[..length].to_vec())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("SSH channel closed during download"))?;
+                    remaining -= length as u64;
+                }
+                Self::send_json(
+                    &transfer_handle,
+                    channel,
+                    &json!({"type":"done", "id":id, "size":size}),
+                )
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+
+            if let Err(error) = transfer_result {
+                eprintln!("download {id} failed: {error:#}; closing SSH channel");
+                // Once raw transfer mode has started, sending JSON errors
+                // would be interpreted as file bytes by the client. Closing
+                // the channel makes its exact-length read fail safely.
+                let _ = transfer_handle.close(channel).await;
+            }
+        });
         Ok(())
     }
 
