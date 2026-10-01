@@ -17,6 +17,12 @@ pub struct Request {
     #[serde(default)]
     pub size: Option<u64>,
     #[serde(default)]
+    pub offset: u64,
+    #[serde(default)]
+    pub transfer_id: Option<String>,
+    #[serde(default)]
+    pub checksum: Option<String>,
+    #[serde(default)]
     pub recursive: bool,
 }
 

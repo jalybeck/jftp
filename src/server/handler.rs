@@ -17,7 +17,7 @@ use russh::{
 use serde_json::{Value, json};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     sync::mpsc,
 };
 use tokio_util::sync::CancellationToken;
@@ -28,8 +28,10 @@ use crate::{
     protocol::{MAX_JSON_LINE, Request, SUBSYSTEM_NAME, TRANSFER_CHUNK_SIZE},
 };
 
+use super::uploads::UploadLease;
 use super::{ServerContext, UserAccount};
 
+#[derive(Default)]
 struct SessionState {
     account: Option<UserAccount>,
     home_directory: Option<PathBuf>,
@@ -39,23 +41,8 @@ struct SessionState {
     input_line: Vec<u8>,
     discard_json_line: bool,
     upload: Option<UploadState>,
+    resumable_upload: Option<UploadLease>,
     deletion: Option<DeletionJob>,
-}
-
-impl Default for SessionState {
-    fn default() -> Self {
-        Self {
-            account: None,
-            home_directory: None,
-            current_working_directory: None,
-            channel: None,
-            subsystem_ready: false,
-            input_line: Vec::new(),
-            discard_json_line: false,
-            upload: None,
-            deletion: None,
-        }
-    }
 }
 
 struct UploadState {
@@ -177,6 +164,17 @@ impl JftpHandler {
             "cancel" => self.cancel_delete(handle, channel, &request).await?,
             "download" => self.download(handle, channel, &request).await?,
             "upload" => self.start_upload(handle, channel, &request).await?,
+            "upload_ack" => {
+                let token = request
+                    .transfer_id
+                    .as_deref()
+                    .context("upload_ack requires a transfer ID")?;
+                self.context
+                    .uploads
+                    .acknowledge(token, &self.account()?.name)
+                    .await?;
+                Self::send_json(handle, channel, &json!({"type":"done", "id":id})).await?;
+            }
             unknown => bail!("unknown command: {unknown}"),
         }
         Ok(())
@@ -585,14 +583,13 @@ impl JftpHandler {
             bail!("download source is not a regular file");
         }
         let size = metadata.len();
+        let offset = request.offset;
+        if offset > size {
+            bail!("download offset exceeds source size");
+        }
+        let expected_checksum = request.checksum.clone();
         let id = request.id.clone();
         let display_path = paths.display(&resolved);
-        Self::send_json(
-            handle,
-            channel,
-            &json!({"type":"ready", "id":id, "transfer":"download", "size":size, "path":display_path}),
-        )
-        .await?;
 
         // Handler::data runs on russh's session task. Sending the whole file
         // through Handle::data here would fill that same task's bounded
@@ -602,7 +599,39 @@ impl JftpHandler {
         let transfer_handle = handle.clone();
         tokio::spawn(async move {
             let transfer_result = async {
-                let mut remaining = size;
+                // Hash outside the SSH session callback, so keepalives and
+                // disconnects continue to be processed during a large scan.
+                let checksum = crate::transfer::checksum(&mut file).await?;
+                if expected_checksum
+                    .as_deref()
+                    .is_some_and(|expected| expected != checksum)
+                {
+                    Self::send_error(
+                        &transfer_handle,
+                        channel,
+                        &id,
+                        "download source changed; refusing to resume a different file",
+                    )
+                    .await?;
+                    Self::send_json(
+                        &transfer_handle,
+                        channel,
+                        &json!({"type":"done", "id":id, "ok":false}),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                file.seek(std::io::SeekFrom::Start(offset)).await?;
+                Self::send_json(
+                    &transfer_handle,
+                    channel,
+                    &json!({
+                        "type":"ready", "id":id, "transfer":"download", "size":size,
+                        "offset":offset, "checksum":checksum, "path":display_path,
+                    }),
+                )
+                .await?;
+                let mut remaining = size - offset;
                 let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
                 while remaining > 0 {
                     let length =
@@ -647,7 +676,7 @@ impl JftpHandler {
         if !account.can_write {
             bail!("this account does not have write permission");
         }
-        if self.state.upload.is_some() {
+        if self.state.upload.is_some() || self.state.resumable_upload.is_some() {
             bail!("an upload is already in progress");
         }
         let size = request.size.context("upload requires a size")?;
@@ -656,6 +685,43 @@ impl JftpHandler {
             .as_deref()
             .context("upload requires a destination path")?;
         let paths = self.paths()?;
+        if let Some(token) = request.transfer_id.as_deref() {
+            let (_, destination) = paths.resolve_file_destination(self.cwd()?, input).await?;
+            let display = paths.display(&destination);
+            let (lease, offset, completed) = self
+                .context
+                .uploads
+                .begin(
+                    token,
+                    &account.name,
+                    destination,
+                    size,
+                    request.checksum.as_deref(),
+                    &request.id,
+                )
+                .await?;
+            if !completed {
+                self.state.resumable_upload = Some(lease);
+            }
+            Self::send_json(
+                handle,
+                channel,
+                &json!({
+                    "type":"ready", "id":request.id, "transfer":"upload", "size":size,
+                    "offset":offset, "transfer_id":token, "checksum":request.checksum,
+                }),
+            )
+            .await?;
+            if completed {
+                Self::send_json(
+                    handle,
+                    channel,
+                    &json!({"type":"done", "id":request.id, "size":size, "path":display}),
+                )
+                .await?;
+            }
+            return Ok(());
+        }
         let (_parent, destination) = paths.resolve_new_file(self.cwd()?, input).await?;
         let leaf = destination
             .file_name()
@@ -719,6 +785,44 @@ impl JftpHandler {
         channel: ChannelId,
         bytes: &[u8],
     ) -> anyhow::Result<usize> {
+        if let Some(upload) = self.state.resumable_upload.as_mut() {
+            let count =
+                usize::try_from(upload.remaining.min(bytes.len() as u64)).unwrap_or(bytes.len());
+            if let Err(error) = upload.write(bytes).await {
+                // After the final byte the client is waiting for JSON again,
+                // so report validation/publication failures without retrying.
+                if upload.remaining == 0 {
+                    let upload = self
+                        .state
+                        .resumable_upload
+                        .take()
+                        .expect("upload lease was present");
+                    Self::send_error(handle, channel, &upload.id, format!("{error:#}")).await?;
+                    Self::send_json(
+                        handle,
+                        channel,
+                        &json!({"type":"done", "id":upload.id, "ok":false}),
+                    )
+                    .await?;
+                    return Ok(count);
+                }
+                return Err(error);
+            }
+            if upload.remaining == 0 {
+                let upload = self
+                    .state
+                    .resumable_upload
+                    .take()
+                    .expect("upload lease was present");
+                Self::send_json(
+                    handle,
+                    channel,
+                    &json!({"type":"done", "id":upload.id, "size":upload.size}),
+                )
+                .await?;
+            }
+            return Ok(count);
+        }
         let Some(upload) = self.state.upload.as_mut() else {
             return Ok(0);
         };
@@ -928,7 +1032,7 @@ impl Handler for JftpHandler {
                 }
                 return Ok(());
             }
-            if self.state.upload.is_some() {
+            if self.state.upload.is_some() || self.state.resumable_upload.is_some() {
                 let consumed = self
                     .ingest_upload(&handle, channel, &data[offset..])
                     .await?;
@@ -983,6 +1087,7 @@ impl Handler for JftpHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self.state.channel == Some(channel) {
+            self.state.resumable_upload = None;
             self.state.channel = None;
             self.state.subsystem_ready = false;
             if let Some(job) = &self.state.deletion {
@@ -1001,6 +1106,7 @@ impl Handler for JftpHandler {
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         if self.state.channel == Some(channel) {
+            self.state.resumable_upload = None;
             if let Some(job) = &self.state.deletion {
                 job.cancellation.cancel();
             }

@@ -1,4 +1,7 @@
 mod handler;
+#[cfg(test)]
+mod reconnect_tests;
+mod uploads;
 
 use std::{
     collections::HashMap,
@@ -34,6 +37,7 @@ pub struct UserAccount {
 pub struct ServerContext {
     pub root_directory: PathBuf,
     pub users: HashMap<String, UserAccount>,
+    uploads: uploads::UploadStore,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +260,7 @@ pub async fn run(
     let context = Arc::new(ServerContext {
         root_directory,
         users,
+        uploads: Default::default(),
     });
     let config = Arc::new(server::Config {
         keys: vec![host_key],

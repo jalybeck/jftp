@@ -30,7 +30,7 @@ impl PathSecurity {
     /// object before use so `..` and symlinks cannot cross the user's boundary.
     pub fn candidate(&self, cwd: &Path, input: &str) -> anyhow::Result<PathBuf> {
         let input_path = Path::new(input);
-        let base = if input_path.is_absolute() {
+        let base = if input_path.has_root() {
             &self.home
         } else {
             cwd
@@ -67,6 +67,18 @@ impl PathSecurity {
         cwd: &Path,
         input: &str,
     ) -> anyhow::Result<(PathBuf, PathBuf)> {
+        let (parent, destination) = self.resolve_file_destination(cwd, input).await?;
+        if tokio::fs::try_exists(&destination).await? {
+            bail!("destination already exists: {}", self.display(&destination));
+        }
+        Ok((parent, destination))
+    }
+
+    pub(crate) async fn resolve_file_destination(
+        &self,
+        cwd: &Path,
+        input: &str,
+    ) -> anyhow::Result<(PathBuf, PathBuf)> {
         let candidate = self.candidate(cwd, input)?;
         let leaf = candidate
             .file_name()
@@ -84,9 +96,6 @@ impl PathSecurity {
         })?;
         self.ensure_inside(&canonical_parent)?;
         let destination = canonical_parent.join(leaf);
-        if tokio::fs::try_exists(&destination).await? {
-            bail!("destination already exists: {}", self.display(&destination));
-        }
         Ok((canonical_parent, destination))
     }
 

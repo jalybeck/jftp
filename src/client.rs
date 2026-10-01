@@ -2,7 +2,7 @@ use std::{
     io::{IsTerminal, SeekFrom, Write as IoWrite},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, bail};
@@ -16,10 +16,7 @@ use russh::{
 use serde_json::{Value, json};
 use tokio::{
     fs::{self, File, OpenOptions},
-    io::{
-        AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt,
-        BufReader,
-    },
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::ToSocketAddrs,
 };
 use uuid::Uuid;
@@ -48,6 +45,61 @@ pub enum ClientCommand {
     Cd { path: String },
     LocalCd { path: PathBuf },
     Mkdir { path: String },
+}
+
+const IO_TIMEOUT: Duration = Duration::from_secs(120);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const RECONNECT_WINDOW: Duration = Duration::from_secs(300);
+
+#[derive(Debug)]
+struct ConnectionLost(String);
+
+impl std::fmt::Display for ConnectionLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+impl std::error::Error for ConnectionLost {}
+
+fn is_connection_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<ConnectionLost>())
+}
+
+fn classify_connect_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| {
+        cause.is::<std::io::Error>()
+            || cause.downcast_ref::<russh::Error>().is_some_and(|error| {
+                matches!(error, russh::Error::Disconnect | russh::Error::SendError)
+            })
+    }) {
+        ConnectionLost(format!("SSH connection failed: {error:#}")).into()
+    } else {
+        error
+    }
+}
+
+async fn network_io<T, E: Into<anyhow::Error>>(
+    ssh: &client::Handle<JftpClientHandler>,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> anyhow::Result<T> {
+    let operation = tokio::time::timeout(IO_TIMEOUT, future);
+    tokio::pin!(operation);
+    let mut health_check = tokio::time::interval(Duration::from_millis(250));
+    loop {
+        tokio::select! {
+            biased;
+            result = &mut operation => return match result {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(error)) => Err(ConnectionLost(format!("SSH I/O failed: {:#}", error.into())).into()),
+                Err(_) => Err(ConnectionLost("SSH I/O timed out".into()).into()),
+            },
+            _ = health_check.tick() => {
+                if ssh.is_closed() {
+                    return Err(ConnectionLost("SSH connection closed".into()).into());
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -79,6 +131,7 @@ struct JftpClientHandler {
     host: String,
     port: u16,
     known_hosts: PathBuf,
+    allow_unknown_host: bool,
 }
 
 impl client::Handler for JftpClientHandler {
@@ -114,6 +167,9 @@ impl client::Handler for JftpClientHandler {
             }
         }
 
+        if !self.allow_unknown_host {
+            bail!("server host key is no longer trusted; refusing automatic reconnection");
+        }
         if !confirm_host_key(&self.host, self.port, &key, &self.known_hosts).await? {
             return Ok(false);
         }
@@ -235,20 +291,141 @@ async fn add_known_host(
     Ok(())
 }
 
-pub struct ClientSession<R, W> {
-    reader: BufReader<R>,
-    writer: W,
+type SshReader = tokio::io::ReadHalf<russh::ChannelStream<client::Msg>>;
+type SshWriter = tokio::io::WriteHalf<russh::ChannelStream<client::Msg>>;
+
+pub struct ClientSession {
+    reader: BufReader<SshReader>,
+    writer: SshWriter,
     cwd: String,
     local_cwd: PathBuf,
     _ssh: client::Handle<JftpClientHandler>,
+    options: ConnectionOptions,
+    key: Arc<keys::PrivateKey>,
+    needs_reconnect: bool,
 }
 
-impl<R, W> ClientSession<R, W>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+impl ClientSession {
     pub async fn run_command(&mut self, command: ClientCommand) -> anyhow::Result<bool> {
+        // Freeze cd's destination before sending it: the cwd event may arrive
+        // even when its final done event is lost. Replaying a relative cd from
+        // the newly restored directory would otherwise change it twice.
+        let command = match command {
+            ClientCommand::Cd { path } if !Path::new(&path).has_root() => ClientCommand::Cd {
+                path: format!("{}/{path}", self.cwd.trim_end_matches('/')),
+            },
+            other => other,
+        };
+        let local = matches!(
+            command,
+            ClientCommand::LocalList { .. }
+                | ClientCommand::LocalPwd
+                | ClientCommand::LocalCd { .. }
+        );
+        if !local && (self.needs_reconnect || self._ssh.is_closed()) {
+            self.reconnect().await?;
+        }
+        let replay_safe = matches!(
+            command,
+            ClientCommand::List { .. }
+                | ClientCommand::Search { .. }
+                | ClientCommand::Pwd
+                | ClientCommand::Cd { .. }
+        );
+        let transfer = matches!(
+            command,
+            ClientCommand::Upload { .. } | ClientCommand::Download { .. }
+        );
+        let deadline = tokio::time::Instant::now() + RECONNECT_WINDOW;
+        loop {
+            let result = self.run_command_once(command.clone()).await;
+            match result {
+                Err(error) if !local && !transfer && is_connection_error(&error) => {
+                    self.needs_reconnect = true;
+                    self.reconnect_before(deadline).await?;
+                    if !replay_safe {
+                        return Err(error.context("connection restored; command was not repeated because its outcome may be unknown"));
+                    }
+                }
+                Err(error) if transfer => {
+                    self.needs_reconnect = true;
+                    return Err(error);
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn reconnect(&mut self) -> anyhow::Result<()> {
+        self.reconnect_before(tokio::time::Instant::now() + RECONNECT_WINDOW)
+            .await
+    }
+
+    async fn reconnect_before(&mut self, deadline: tokio::time::Instant) -> anyhow::Result<()> {
+        self.needs_reconnect = true;
+        eprintln!("SSH connection lost. Reconnecting for up to 5 minutes (Ctrl+C cancels)...");
+        let cwd = self.cwd.clone();
+        let local_cwd = self.local_cwd.clone();
+        let options = self.options.clone();
+        let key = self.key.clone();
+        let retry = async {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                let attempt = tokio::time::timeout_at(
+                    deadline,
+                    connect_with_key(
+                        &options,
+                        (options.host.as_str(), options.port),
+                        key.clone(),
+                        false,
+                    ),
+                )
+                .await;
+                match attempt {
+                    Ok(Ok(mut replacement)) => {
+                        replacement.local_cwd = local_cwd.clone();
+                        if cwd != "/" {
+                            if let Err(error) = replacement.change_remote_directory(&cwd).await {
+                                if !is_connection_error(&error) {
+                                    return Err(
+                                        error.context("could not restore remote working directory")
+                                    );
+                                }
+                            } else {
+                                return Ok(replacement);
+                            }
+                        } else {
+                            return Ok(replacement);
+                        }
+                    }
+                    Ok(Err(error)) if !is_connection_error(&error) => return Err(error),
+                    Err(_) => bail!("could not reconnect within 5 minutes"),
+                    _ => {}
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    bail!("could not reconnect within 5 minutes");
+                }
+                tokio::time::sleep_until((tokio::time::Instant::now() + delay).min(deadline)).await;
+                delay = (delay * 2).min(Duration::from_secs(10));
+            }
+        };
+        let replacement = tokio::select! {
+            result = retry => result?,
+            signal = tokio::signal::ctrl_c() => { signal?; bail!("reconnection cancelled"); }
+        };
+        // Retire an old half-open transport without waiting for the network.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(100),
+            self._ssh
+                .disconnect(russh::Disconnect::ByApplication, "reconnecting", ""),
+        )
+        .await;
+        *self = replacement;
+        eprintln!("SSH connection restored. Remote directory: {}", self.cwd);
+        Ok(())
+    }
+
+    async fn run_command_once(&mut self, command: ClientCommand) -> anyhow::Result<bool> {
         match command {
             ClientCommand::List { path } => {
                 print_listing_header(path.as_deref().unwrap_or(&self.cwd), false);
@@ -298,10 +475,7 @@ where
             }
             ClientCommand::LocalPwd => println!("{}", display_local_path(&self.local_cwd)),
             ClientCommand::Cd { path } => {
-                let id = Uuid::new_v4().to_string();
-                self.send_request(&json!({"id":id, "command":"cd", "path":path}))
-                    .await?;
-                self.read_stream(&id, false, OutputKind::Other).await?;
+                self.change_remote_directory(&path).await?;
             }
             ClientCommand::LocalCd { path } => {
                 self.local_cwd = change_local_directory(&self.local_cwd, &path).await?;
@@ -317,15 +491,22 @@ where
         Ok(true)
     }
 
+    async fn change_remote_directory(&mut self, path: &str) -> anyhow::Result<()> {
+        let id = Uuid::new_v4().to_string();
+        self.send_request(&json!({"id":id, "command":"cd", "path":path}))
+            .await?;
+        self.read_stream(&id, false, OutputKind::Other).await
+    }
+
     async fn send_request(&mut self, request: &Value) -> anyhow::Result<()> {
-        write_jsonl(&mut self.writer, request).await
+        network_io(&self._ssh, write_jsonl(&mut self.writer, request)).await
     }
 
     async fn next_response(&mut self) -> anyhow::Result<Value> {
         let mut line = Vec::new();
-        let read = self.reader.read_until(b'\n', &mut line).await?;
+        let read = network_io(&self._ssh, self.reader.read_until(b'\n', &mut line)).await?;
         if read == 0 {
-            bail!("SSH connection closed by the server");
+            return Err(ConnectionLost("SSH connection closed by the server".into()).into());
         }
         if line.len() > MAX_JSON_LINE {
             bail!("server response exceeds the 1 MiB JSONL limit");
@@ -410,6 +591,7 @@ where
     }
 
     async fn read_expected_event(&mut self, id: &str) -> anyhow::Result<Value> {
+        let mut remote_error = None;
         loop {
             let response = self.next_response().await?;
             let response_id = response
@@ -425,75 +607,108 @@ where
                 continue;
             }
             if event_type == "error" {
-                bail!(
-                    "{}",
-                    response
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("remote error")
-                );
+                remote_error = Some(response_error(&response));
+                continue;
             }
             if event_type == "ready" {
                 return Ok(response);
             }
             render_response(&response, OutputKind::Other);
             if event_type == "done" {
+                if let Some(error) = remote_error {
+                    bail!("{error}");
+                }
                 bail!("server finished before beginning the transfer");
             }
         }
     }
 
+    async fn recover_transfer(
+        &mut self,
+        deadline: &mut Option<tokio::time::Instant>,
+    ) -> anyhow::Result<()> {
+        let limit = *deadline.get_or_insert_with(|| tokio::time::Instant::now() + RECONNECT_WINDOW);
+        if tokio::time::Instant::now() >= limit {
+            bail!("transfer made no progress for 5 minutes");
+        }
+        self.reconnect_before(limit).await
+    }
+
     async fn upload(&mut self, local: &Path, remote: &str) -> anyhow::Result<()> {
-        let metadata = fs::metadata(local)
+        let mut source = File::open(local)
             .await
-            .with_context(|| format!("cannot read local file {}", local.display()))?;
+            .with_context(|| format!("cannot open local file {}", local.display()))?;
+        let metadata = source.metadata().await?;
         if !metadata.is_file() {
-            bail!("upload source is not a regular file: {}", local.display());
+            bail!("upload source is not a regular file");
         }
         let size = metadata.len();
-        let id = Uuid::new_v4().to_string();
-        self.send_request(&json!({"id":id, "command":"upload", "path":remote, "size":size}))
-            .await?;
-        let ready = self.read_expected_event(&id).await?;
-        if ready.get("transfer").and_then(Value::as_str) != Some("upload")
-            || ready.get("size").and_then(Value::as_u64) != Some(size)
-        {
-            bail!("server returned an invalid upload handshake");
-        }
-
-        let mut source = File::open(local).await?;
-        let mut remaining = size;
+        eprintln!("Checking upload SHA-256...");
+        let checksum = crate::transfer::checksum(&mut source).await?;
+        let token = Uuid::new_v4().to_string();
+        let mut confirmed = 0;
+        let mut deadline = None;
         let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
         let mut progress = TransferProgress::new("upload", size);
-        while remaining > 0 {
-            let length =
-                usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-            let read = source.read(&mut buffer[..length]).await?;
-            if read == 0 {
-                bail!("local upload source changed before all declared bytes were read");
+        loop {
+            let attempt = async {
+                let id = Uuid::new_v4().to_string();
+                self.send_request(&json!({"id":id, "command":"upload", "path":remote,
+                    "size":size, "transfer_id":token, "checksum":checksum})).await?;
+                let ready = self.read_expected_event(&id).await?;
+                if ready.get("transfer").and_then(Value::as_str) != Some("upload")
+                    || ready.get("size").and_then(Value::as_u64) != Some(size)
+                    || ready.get("transfer_id").and_then(Value::as_str) != Some(token.as_str())
+                    || ready.get("checksum").and_then(Value::as_str) != Some(checksum.as_str())
+                { bail!("server does not support safe resumable uploads or returned an invalid handshake"); }
+                let offset = ready.get("offset").and_then(Value::as_u64)
+                    .filter(|offset| *offset <= size).context("invalid upload resume offset")?;
+                if offset > confirmed { deadline = None; }
+                confirmed = offset;
+                if offset > 0 { eprintln!("Resuming upload at byte {offset} of {size}."); }
+                source.seek(SeekFrom::Start(offset)).await?;
+                progress.set_position(offset);
+                let mut remaining = size - offset;
+                while remaining > 0 {
+                    let length = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+                    let read = source.read(&mut buffer[..length]).await?;
+                    if read == 0 { bail!("local upload source changed during transfer"); }
+                    network_io(&self._ssh, self.writer.write_all(&buffer[..read])).await?;
+                    remaining -= read as u64;
+                    progress.advance(read as u64);
+                }
+                network_io(&self._ssh, self.writer.flush()).await?;
+                self.read_stream(&id, false, OutputKind::Transfer).await?;
+                Ok::<(), anyhow::Error>(())
+            }.await;
+            match attempt {
+                Ok(()) => break,
+                Err(error) if is_connection_error(&error) => {
+                    self.recover_transfer(&mut deadline).await?
+                }
+                Err(error) => return Err(error),
             }
-            self.writer.write_all(&buffer[..read]).await?;
-            remaining -= read as u64;
-            progress.advance(read as u64);
         }
-        self.writer.flush().await?;
-        self.read_stream(&id, false, OutputKind::Transfer).await?;
         print_transfer_done("Uploaded", &display_local_path(local), remote, size);
+        // The final done event already confirmed publication. A lost cleanup
+        // acknowledgement must not turn a successful upload into a retry.
+        let acknowledgement = async {
+            let id = Uuid::new_v4().to_string();
+            self.send_request(&json!({"id":id, "command":"upload_ack", "transfer_id":token}))
+                .await?;
+            self.read_stream(&id, false, OutputKind::Transfer).await
+        }
+        .await;
+        if acknowledgement.is_err() {
+            self.needs_reconnect = true;
+        }
         Ok(())
     }
 
     async fn download(&mut self, remote: &str, local: &Path) -> anyhow::Result<()> {
-        let id = Uuid::new_v4().to_string();
-        self.send_request(&json!({"id":id, "command":"download", "path":remote}))
-            .await?;
-        let ready = self.read_expected_event(&id).await?;
-        if ready.get("transfer").and_then(Value::as_str) != Some("download") {
-            bail!("server returned an invalid download handshake");
+        if fs::try_exists(local).await? {
+            bail!("local destination already exists: {}", local.display());
         }
-        let size = ready
-            .get("size")
-            .and_then(Value::as_u64)
-            .context("download handshake has no valid size")?;
         let parent = local
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -504,6 +719,7 @@ where
             .to_string_lossy();
         let temporary = parent.join(format!(".{leaf}.jftp-{}.part", Uuid::new_v4()));
         let mut destination = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temporary)
@@ -511,45 +727,73 @@ where
             .with_context(|| {
                 format!("cannot create local temporary file {}", temporary.display())
             })?;
-        let mut progress = TransferProgress::new("download", size);
+        let mut received = 0_u64;
+        let mut expected_checksum: Option<String> = None;
+        let mut expected_size = None;
+        let mut deadline = None;
+        let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
         let transfer_result = async {
-            let mut remaining = size;
-            let mut buffer = vec![0_u8; TRANSFER_CHUNK_SIZE];
-            while remaining > 0 {
-                let length =
-                    usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
-                self.reader
-                    .read_exact(&mut buffer[..length])
-                    .await
-                    .context("SSH connection closed during download")?;
-                destination.write_all(&buffer[..length]).await?;
-                remaining -= length as u64;
-                progress.advance(length as u64);
+            loop {
+                let attempt = async {
+                    let id = Uuid::new_v4().to_string();
+                    self.send_request(&json!({"id":id, "command":"download", "path":remote,
+                        "offset":received, "checksum":expected_checksum})).await?;
+                    let ready = self.read_expected_event(&id).await?;
+                    if ready.get("transfer").and_then(Value::as_str) != Some("download")
+                        || ready.get("offset").and_then(Value::as_u64) != Some(received)
+                    { bail!("server does not support safe resumable downloads or returned an invalid handshake"); }
+                    let size = ready.get("size").and_then(Value::as_u64).context("invalid download size")?;
+                    let checksum = crate::transfer::validate_checksum(ready.get("checksum").and_then(Value::as_str))?.to_owned();
+                    if received > size || expected_size.is_some_and(|old| old != size)
+                        || expected_checksum.as_ref().is_some_and(|old| old != &checksum)
+                    { bail!("download source changed; refusing to combine different files"); }
+                    expected_size = Some(size);
+                    expected_checksum = Some(checksum);
+                    let mut progress = TransferProgress::new("download", size);
+                    progress.set_position(received);
+                    if received > 0 { eprintln!("Resuming download at byte {received} of {size}."); }
+                    destination.seek(SeekFrom::Start(received)).await?;
+                    while received < size {
+                        let length = usize::try_from((size - received).min(buffer.len() as u64)).unwrap_or(buffer.len());
+                        // read() preserves every received byte on disconnect;
+                        // read_exact() can consume a partial chunk before failing.
+                        let read = network_io(&self._ssh, self.reader.read(&mut buffer[..length])).await?;
+                        if read == 0 { return Err(ConnectionLost("SSH connection closed during download".into()).into()); }
+                        destination.write_all(&buffer[..read]).await?;
+                        received += read as u64;
+                        deadline = None;
+                        progress.advance(read as u64);
+                    }
+                    self.read_stream(&id, false, OutputKind::Transfer).await?;
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                match attempt {
+                    Ok(()) => break,
+                    Err(error) if is_connection_error(&error) => self.recover_transfer(&mut deadline).await?,
+                    Err(error) => return Err(error),
+                }
             }
             destination.flush().await?;
-            drop(destination);
-            fs::hard_link(&temporary, local).await.with_context(|| {
-                format!(
-                    "local destination already exists or cannot be published: {}",
-                    local.display()
-                )
-            })?;
-            fs::remove_file(&temporary).await?;
-            let response = self.next_response().await?;
-            if response.get("id").and_then(Value::as_str) != Some(id.as_str())
-                || response.get("type").and_then(Value::as_str) != Some("done")
-                || response.get("ok").and_then(Value::as_bool) == Some(false)
-            {
-                bail!("server did not finish the download cleanly");
+            destination.sync_all().await?;
+            if crate::transfer::checksum(&mut destination).await? != expected_checksum.as_deref().context("missing download checksum")? {
+                bail!("download SHA-256 checksum mismatch; destination was not published");
             }
             Ok::<(), anyhow::Error>(())
-        }
-        .await;
-        if transfer_result.is_err() {
+        }.await;
+        drop(destination);
+        if let Err(error) = transfer_result {
             let _ = fs::remove_file(&temporary).await;
+            return Err(error);
         }
-        transfer_result?;
-        print_transfer_done("Downloaded", remote, &display_local_path(local), size);
+        let publish_result = fs::hard_link(&temporary, local).await;
+        let _ = fs::remove_file(&temporary).await;
+        publish_result.with_context(|| {
+            format!(
+                "local destination already exists or cannot be published: {}",
+                local.display()
+            )
+        })?;
+        print_transfer_done("Downloaded", remote, &display_local_path(local), received);
         Ok(())
     }
 }
@@ -566,6 +810,12 @@ struct TransferProgress {
 }
 
 impl TransferProgress {
+    fn set_position(&mut self, position: u64) {
+        self.transferred = position.min(self.total);
+        if self.interactive {
+            self.draw();
+        }
+    }
     fn new(direction: &'static str, total: u64) -> Self {
         let mut progress = Self {
             direction,
@@ -1104,13 +1354,7 @@ fn render_response(response: &Value, output: OutputKind) {
 pub async fn connect<R: ToSocketAddrs>(
     options: &ConnectionOptions,
     address: R,
-) -> anyhow::Result<
-    ClientSession<
-        tokio::io::ReadHalf<russh::ChannelStream<client::Msg>>,
-        tokio::io::WriteHalf<russh::ChannelStream<client::Msg>>,
-    >,
-> {
-    let local_cwd = std::env::current_dir().context("cannot determine local directory")?;
+) -> anyhow::Result<ClientSession> {
     let key_text = tokio::fs::read_to_string(&options.identity_file)
         .await
         .with_context(|| {
@@ -1140,59 +1384,83 @@ pub async fn connect<R: ToSocketAddrs>(
         bail!("client identity must be an Ed25519 private key");
     }
 
-    let mut ssh = client::connect(
-        Arc::new(client::Config {
-            nodelay: true,
-            ..Default::default()
-        }),
-        address,
-        JftpClientHandler {
-            host: options.host.clone(),
-            port: options.port,
-            known_hosts: options.known_hosts_file.clone(),
-        },
-    )
-    .await
-    .context("SSH connection failed")?;
-    let result = ssh
-        .authenticate_publickey(
-            options.username.clone(),
-            PrivateKeyWithHashAlg::new(Arc::new(key), None),
-        )
-        .await
-        .context("public-key authentication failed")?;
-    if result != AuthResult::Success {
-        bail!(
-            "server rejected the Ed25519 key for user {:?}",
-            options.username
-        );
-    }
-
-    let channel = ssh
-        .channel_open_session()
-        .await
-        .context("could not open SSH session channel")?;
-    channel
-        .request_subsystem(true, SUBSYSTEM_NAME)
-        .await
-        .context("server does not accept the jftp subsystem")?;
-    let (reader, writer) = tokio::io::split(channel.into_stream());
-    Ok(ClientSession {
-        reader: BufReader::new(reader),
-        writer,
-        cwd: "/".to_owned(),
-        local_cwd,
-        _ssh: ssh,
-    })
+    connect_with_key(options, address, Arc::new(key), true).await
 }
 
-pub async fn run_interactive<R, W>(session: &mut ClientSession<R, W>) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
+async fn connect_with_key<R: ToSocketAddrs>(
+    options: &ConnectionOptions,
+    address: R,
+    key: Arc<keys::PrivateKey>,
+    allow_unknown_host: bool,
+) -> anyhow::Result<ClientSession> {
+    let local_cwd = std::env::current_dir().context("cannot determine local directory")?;
+    let connection = async {
+        let mut ssh = client::connect(
+            Arc::new(client::Config {
+                nodelay: true,
+                keepalive_interval: Some(Duration::from_secs(10)),
+                keepalive_max: 6,
+                ..Default::default()
+            }),
+            address,
+            JftpClientHandler {
+                host: options.host.clone(),
+                port: options.port,
+                known_hosts: options.known_hosts_file.clone(),
+                allow_unknown_host,
+            },
+        )
+        .await
+        .context("SSH connection failed")?;
+        let result = ssh
+            .authenticate_publickey(
+                options.username.clone(),
+                PrivateKeyWithHashAlg::new(key.clone(), None),
+            )
+            .await
+            .context("public-key authentication failed")?;
+        if result != AuthResult::Success {
+            bail!(
+                "server rejected the Ed25519 key for user {:?}",
+                options.username
+            );
+        }
+
+        let channel = ssh
+            .channel_open_session()
+            .await
+            .context("could not open SSH session channel")?;
+        channel
+            .request_subsystem(true, SUBSYSTEM_NAME)
+            .await
+            .context("server does not accept the jftp subsystem")?;
+        let (reader, writer) = tokio::io::split(channel.into_stream());
+        Ok(ClientSession {
+            reader: BufReader::new(reader),
+            writer,
+            cwd: "/".to_owned(),
+            local_cwd,
+            _ssh: ssh,
+            options: options.clone(),
+            key,
+            needs_reconnect: false,
+        })
+    };
+    // First-time host-key confirmation is interactive and may legitimately
+    // take longer than the reconnect attempt timeout.
+    if allow_unknown_host {
+        return connection.await.map_err(classify_connect_error);
+    }
+    match tokio::time::timeout(CONNECT_TIMEOUT, connection).await {
+        Ok(result) => result.map_err(classify_connect_error),
+        Err(_) => Err(ConnectionLost("SSH connection attempt timed out".into()).into()),
+    }
+}
+
+pub async fn run_interactive(session: &mut ClientSession) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
-    let mut input = BufReader::new(stdin);
+    let mut lines = BufReader::new(stdin).lines();
+    let mut health_check = tokio::time::interval(Duration::from_secs(1));
     println!("Connected. Remote directory: {}", session.cwd);
     println!(
         "Local directory: {}",
@@ -1207,10 +1475,23 @@ where
         );
         use std::io::Write;
         std::io::stdout().flush()?;
-        let mut line = String::new();
-        if input.read_line(&mut line).await? == 0 {
+        let line = loop {
+            tokio::select! {
+                line = lines.next_line() => break line?,
+                _ = health_check.tick(), if !session.needs_reconnect => {
+                    if session._ssh.is_closed() {
+                        if let Err(error) = session.reconnect().await {
+                            eprintln!("error: {error:#}");
+                        }
+                        print!("jftp:{}> ", session.cwd);
+                        std::io::stdout().flush()?;
+                    }
+                }
+            }
+        };
+        let Some(line) = line else {
             break;
-        }
+        };
         // Strip CRLF before tokenizing so the final command has no trailing CR.
         let command_line = line.trim_end_matches(['\r', '\n']);
         let words = match split_interactive_command(command_line) {

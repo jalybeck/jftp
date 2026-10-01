@@ -146,6 +146,16 @@ jftp server.example --port 2222 --user alice download /reports/archive.zip ./arc
 
 Uploads and downloads stream in 64 KiB chunks and use the declared byte count to switch between JSONL and raw data. Uploads publish atomically after the exact byte count arrives. Both local downloads and remote uploads refuse to overwrite an existing destination.
 
+## Connection recovery and resumable transfers
+
+The client automatically reconnects when an established SSH connection is lost, including while waiting at the interactive prompt. It checks the connection with SSH keepalives every 10 seconds and allows six unanswered checks. Short traffic interruptions can recover on the existing connection. After a disconnect, reconnect attempts use delays from 1 to 10 seconds for up to five minutes; each connection attempt has a 20-second timeout. Ctrl+C cancels reconnection. The client reuses the unlocked identity key, checks the trusted host key again, and restores the remote working directory and local directory selection.
+
+Uploads continue from the byte count retained by the server; downloads continue from the bytes already written to the client's temporary file. Both directions use SHA-256 checksums to verify the completed content, and a changed download source is rejected before resuming. Files are published only after transfer completion and validation, without overwriting an existing destination. If an upload's completion response is lost, reconnecting recognizes the completed transfer instead of uploading it twice. Checksumming scans the source file before transfer and again before each resumed download, which adds disk I/O for large files.
+
+Directory listings, searches, `pwd`, and `cd` may be retried after reconnection. `rm` and `mkdir` are not automatically repeated: their result may be unknown if the connection failed after the server performed the command.
+
+Automatic transfer recovery applies while the client process remains running. Upload state is retained in the running server for up to 24 hours of inactivity; expired partial uploads are cleaned up when another upload starts. Restarting the client loses its transfer state, and restarting the server loses upload tracking, so this does not provide resume across process restarts. A server restart may leave `.jftp-upload-*.part` files requiring cleanup. Update both client and server to use resumable transfers; a new client refuses an older server's transfer handshake rather than silently restarting or mixing bytes.
+
 ## JSONL session protocol
 
 Open an authenticated SSH session channel and request the subsystem `jftp`. Send one JSON object plus `\n` per command. Each response or progress update is one JSON object plus `\n`. Commands include `list`, `search`, `pwd`, `cd`, `mkdir`, `rm`, `cancel`, `upload`, and `download`.
@@ -157,3 +167,7 @@ For a file transfer, the `ready` event declares `transfer` and `size`. The sende
 ```
 
 The server responds with `ready`, receives exactly 1234 bytes, then emits `done`. Downloads use the same handshake in the opposite direction. This avoids Base64 and keeps file memory bounded to one chunk.
+
+For resumable uploads, include a UUID `transfer_id` and the full file's lowercase SHA-256 `checksum`. Reuse both values after reconnecting. The server's `ready` response includes the total `size`, retained `offset`, `transfer_id`, and `checksum`; send only `size - offset` raw bytes. Transfer IDs are bound to the authenticated user, resolved destination, size, and checksum. A replacement session revokes the previous session's writer. A completed transfer returns `offset == size` followed by `done`, even if its original completion response was lost. Once `done` has been received, send `upload_ack` with `transfer_id` to release the retained state; this command also returns `done`.
+
+For resumable downloads, send `offset` (initially zero), and on subsequent attempts include the `checksum` from the first `ready` response. The server checks that the source still matches and responds with total `size`, `offset`, and `checksum`, followed by exactly `size - offset` raw bytes and `done`. The receiver verifies the full temporary file's checksum before publishing it. Existing upload requests without `transfer_id` still use the original non-resumable behavior.
