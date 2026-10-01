@@ -206,7 +206,6 @@ async fn add_known_host(
     options.read(true).append(true).create(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options

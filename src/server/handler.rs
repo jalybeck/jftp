@@ -487,7 +487,7 @@ impl JftpHandler {
                 {
                     break;
                 }
-                let result = if link_metadata.file_type().is_symlink() {
+                let result: anyhow::Result<()> = if link_metadata.file_type().is_symlink() {
                     #[cfg(windows)]
                     {
                         match fs::remove_file(&candidate).await {

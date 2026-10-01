@@ -357,7 +357,6 @@ async fn load_or_create_host_key(path: &Path, root: &Path) -> anyhow::Result<key
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options

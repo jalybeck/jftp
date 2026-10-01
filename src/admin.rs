@@ -719,7 +719,6 @@ async fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
     let mut file = options
